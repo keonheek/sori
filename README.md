@@ -24,10 +24,10 @@ Hold Right ⌘, speak, release. The text lands at your cursor, in whatever app h
 ## How it works
 
 1. **Hold** Right ⌘ and speak (or tap to toggle)
-2. **Release** — a fast prompt-free pass detects the language (~0.2s), then the warm engine transcribes with the language pinned
-3. **Paste** — cleaned text lands at the cursor and stays on the clipboard for ⌘V recovery
+2. **Release** and a fast prompt-free pass detects the language (~0.2s), then the warm engine transcribes with the language pinned
+3. **Paste**: cleaned text lands at the cursor and stays on the clipboard for ⌘V recovery
 
-Enter while recording stops, transcribes, and submits. Escape cancels. Mis-heard a name? Select your correction and ⌘C once — Sori learns the replacement.
+Enter while recording stops, transcribes, and submits. Escape cancels. Mis-heard a name? Select your correction and ⌘C once, and Sori learns the replacement.
 
 ## Install
 
@@ -40,7 +40,7 @@ git clone https://github.com/keonheek/sori && cd sori
 ./install.sh
 ```
 
-macOS will ask for Microphone, Accessibility, and Input Monitoring — all three are required (mic to hear you, the other two to catch Right ⌘ globally and paste the result).
+macOS will ask for Microphone, Accessibility, and Input Monitoring; all three are required (mic to hear you, the other two to catch Right ⌘ globally and paste the result).
 
 ## Configuration
 
@@ -50,9 +50,9 @@ Settings live in the menu-bar menu and in `~/.sori.conf` (JSON): model, language
 
 Four problems that shaped the architecture, documented because they will bite anyone building on Whisper:
 
-- **Language auto-detect is poisoned by the vocabulary prompt.** An English glossary biases Whisper into detecting Korean speech as English — and then it *translates* rather than mis-transcribes ("발표는 목요일에" → "The announcement is Monday"). Sori detects language in a separate prompt-free pass (base model, ~0.2s, p>0.98), then transcribes with the language pinned. The prompt then influences spelling, never language.
+- **Language auto-detect is poisoned by the vocabulary prompt.** An English glossary biases Whisper into detecting Korean speech as English, and then it *translates* rather than mis-transcribes ("발표는 목요일에" → "The announcement is Monday"). Sori detects language in a separate prompt-free pass (base model, ~0.2s, p>0.98), then transcribes with the language pinned. The prompt then influences spelling, never language.
 - **whisper-server defaults to greedy decoding** (`beam-size -1`) while whisper-cli defaults to beam search 5. Greedy is what produces the "Monday, Monday, Monday" repetition loop on non-English audio. Sori spawns the server with `-bs 5 -bo 5` for CLI-quality output at server speed.
-- **An instruct LLM will answer dictation that sounds like a request** instead of cleaning it — replying "I can clean up the text for you..." straight into the text field. Prompt framing (transcript in tags, model as pure transform) helps, but the reliable fix is structural output validation: same language as input, sane length ratio, no assistant phrases. Any failure falls back to the raw transcript.
+- **An instruct LLM will answer dictation that sounds like a request** instead of cleaning it, replying "I can clean up the text for you..." straight into the text field. Prompt framing (transcript in tags, model as pure transform) helps, but the reliable fix is structural output validation: same language as input, sane length ratio, no assistant phrases. Any failure falls back to the raw transcript.
 - **Whisper keeps only the last 223 prompt tokens**, and dense proper nouns tokenize at ~2.4 chars each, not 4. A long glossary silently cuts the names hint off the head of the prompt.
 
 ## Rebuilding without losing permissions
