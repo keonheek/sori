@@ -1,97 +1,52 @@
-<p align="center"><img src="docs/icon.png" width="128" alt="Sori icon"></p>
+<p align="center"><img src="docs/icon.png" width="100" alt="Sori"></p>
 
-<h1 align="center">Sori (소리)</h1>
+# Sori (소리)
 
-<p align="center"><b>Push-to-talk dictation for macOS that actually handles Korean, English, and switching between them mid-sentence. Runs entirely on your machine.</b></p>
+Push-to-talk dictation for macOS. Hold Right ⌘, speak Korean or English or a mix of both, release, and the text lands at your cursor. Whisper runs locally; nothing is uploaded anywhere.
 
----
-
-Hold **Right ⌘**, speak, release. Your words appear at the cursor. Audio never leaves your machine and there is nothing to subscribe to. Sori started as a replacement for a paid dictation subscription and ended up handling bilingual speech better than the tools it replaced.
-
-## Why another dictation app
-
-Most Whisper-based dictation tools break on bilingual speakers. Speak Korean with an English tech term in the middle, or switch languages between sentences, and you get translations you never asked for, or transliterated gibberish. Sori fixes this with a detail most tools skip: a **prompt-free language pre-detection pass**. Whisper's built-in auto-detect is biased by the English vocabulary prompt most apps feed it, and that bias can silently *translate* your Korean into English. Sori detects the language first with a fast pass on the raw audio (about 0.2s, with no prompt in play), then locks it for transcription. Vocabulary hints improve accuracy without ever flipping the output language.
-
-## Features
-
-- **Push-to-talk or toggle**: hold Right ⌘ to talk, or tap to toggle. Enter submits, Escape cancels. A compact floating indicator shows recording state and mic level.
-- **Warm engine**: a resident `whisper-server` keeps the model in RAM. Measured on an M-series Mac, that means 0.3-0.6s per dictation instead of 1.1-1.3s cold (large-v3-turbo, 8-9s clips). Sori falls back to `whisper-cli` automatically if the server is down.
-- **Bilingual by design**: Korean, English, and mixed recordings all work. Embedded English inside Korean sentences survives untranslated.
-- **AI cleanup (optional, free)**: dictation comes out with fillers ("um", "음", "어") removed, punctuation fixed, and false starts resolved to the corrected form ("Thursday... no wait, Friday" becomes "Friday"). This runs on Groq's free tier via `gpt-oss-120b`. A structural guard rejects any response where the model answered instead of cleaned, so the worst case is always your raw words, never the model's.
-- **Custom vocabulary**: a glossary and names list biases recognition toward your terms (product names, teammates, jargon).
-- **Learns from your corrections**: fix a mis-transcribed word once (select and copy the corrected text) and Sori learns the replacement.
-- **Smart spacing**: consecutive dictations get proper spacing between them.
-- **Private**: audio never leaves your machine. The only optional network call is the text-cleanup step, which you can toggle off in the menu.
+I built this after I stopped paying for a dictation subscription, and it ended up handling bilingual speech better than the paid tools did. Most Whisper apps break the moment you code-switch: Korean with an English tech term in the middle comes back translated, or as transliterated nonsense. The fix turned out to be small but non-obvious, and it's the main reason this repo might interest you even if you never install it (see [notes](#notes-for-people-building-their-own) below).
 
 ## Install
 
-**Option A, prebuilt app:** grab `Sori-1.0.0.zip` from [Releases](https://github.com/keonheek/sori/releases), unzip, move to `/Applications`, and right-click > Open on first launch. Then install the engine and models (step 4 in the release notes).
+Prebuilt: download the zip from [Releases](https://github.com/keonheek/sori/releases), unzip into `/Applications`, right-click > Open the first time (unsigned app warning, once). Then follow step 4 in the release notes to install whisper-cpp and the models.
 
-**Option B, build from source:**
+From source:
 
 ```bash
 git clone https://github.com/keonheek/sori && cd sori
 ./install.sh
 ```
 
-The installer checks for Xcode Command Line Tools and Homebrew, installs `whisper-cpp`, downloads the models (~1.8 GB), builds from source (one Swift file, no Xcode project), and starts Sori. Then grant Microphone, Accessibility, and Input Monitoring in System Settings when prompted.
+Either way, macOS will ask for Microphone, Accessibility, and Input Monitoring. All three are needed: mic for obvious reasons, the other two to catch the Right ⌘ key globally and paste the result.
 
-For the optional AI cleanup, put a free [Groq API key](https://console.groq.com) in `~/.sori-groq` and enable **AI Cleanup (Groq)** in the menu-bar menu.
+## Use
 
-## Usage
+Hold Right ⌘ and talk, or tap it to toggle. Enter while recording stops, transcribes, pastes, and submits. Escape cancels. The pasted text stays on the clipboard so ⌘V recovers it if it landed in the wrong window.
 
-| Action | Result |
-|---|---|
-| Hold Right ⌘, speak, release | Dictate (push-to-talk) |
-| Tap Right ⌘ | Toggle recording on/off |
-| Enter while recording | Stop, transcribe, paste, and press Enter |
-| Escape while recording | Cancel, nothing pastes |
-| Click the floating indicator | Same as Right ⌘ |
+Dictation comes out cleaned: fillers ("um", "음", "어") stripped and self-corrections resolved to what you meant ("목요일에... 아니다, 금요일에" pastes as 금요일에). The rule-based pass is local. There's a second, optional pass through an LLM on Groq's free tier — put a [free API key](https://console.groq.com) in `~/.sori-groq` and flip "AI Cleanup" in the menu. If the model misbehaves, a guard throws its output away and pastes your raw words instead.
 
-Transcribed text is pasted at the cursor and kept on the clipboard, so ⌘V recovers it if the paste landed in the wrong field.
+Fix a mis-heard word once (select the correction, ⌘C) and Sori remembers the replacement.
 
-## Configuration
+Config is a JSON file at `~/.sori.conf`: model, language (`auto` recommended), vocabulary hints, warm engine on/off. The vocabulary list is truncated from the back at ~223 tokens, so put the names you actually say near the front.
 
-Settings live in the menu-bar menu (Settings…) and in `~/.sori.conf` (JSON):
+## Notes for people building their own
 
-- `model`: transcription model (default `ggml-large-v3-turbo.bin`)
-- `lang`: `"auto"` (recommended), or a fixed code like `"en"` / `"ko"`
-- `warmEngine`: resident whisper-server (default on)
-- `llmCleanup`: Groq cleanup layer (default off; enable it in the menu)
-- `promptHint` / `aiTerms`: names and vocabulary to bias recognition. Terms earlier in the list carry more weight, since Whisper reads only the last ~223 prompt tokens and the list is truncated from the back.
+Four things that cost me real debugging time:
 
-## How it works
+**Whisper's language auto-detect is poisoned by your vocabulary prompt.** Feed it an English glossary and it starts detecting Korean speech as English, at which point it doesn't mis-transcribe, it *translates*. "발표는 목요일에" came back as "The announcement is Monday." The fix: detect the language first in a separate pass with no prompt at all (the base model does it in ~0.2s at p>0.98), then transcribe with the language pinned. After that the English prompt only influences spelling, never language.
 
-```
-Right ⌘ down ──▶ record 16 kHz mono
-Right ⌘ up   ──▶ language detect (base model, no prompt, ~0.2s)
-             ──▶ transcribe (resident whisper-server, beam search, language locked)
-             ──▶ rule-based cleanup (fillers, disfluencies)
-             ──▶ optional LLM cleanup (Groq gpt-oss-120b, guarded)
-             ──▶ paste at cursor
-```
+**whisper-server and whisper-cli have different decoding defaults.** The server ships with greedy decoding (`beam-size -1`); the CLI uses beam search 5. Greedy is what produces the classic "Monday, Monday, Monday, Monday" repetition loop on non-English audio. Sori keeps a resident whisper-server for speed (0.3-0.6s per dictation on Apple Silicon vs 1.1-1.3s reloading the model each press) but spawns it with `-bs 5 -bo 5` to get CLI-quality output.
 
-Details worth stealing if you're building your own:
+**An instruct LLM will answer your dictation instead of cleaning it.** My first cleanup prompt worked until I dictated a sentence that sounded like a request, and the model replied "I can clean up the mixed Korean and English text for you..." straight into the text field I was typing in. Prompt framing helps (transcript in tags, model framed as a pure transform), but the real fix is structural validation of the output: same language as input, sane length ratio, no assistant phrases. Fail any check and the raw transcript pastes.
 
-- **Language detection must be prompt-free.** An English vocabulary prompt biases Whisper's language auto-detection toward English, enough to translate Korean speech outright. Detect on the raw audio first, then prompt.
-- **whisper-server defaults to greedy decoding** (`beam-size -1`), while whisper-cli defaults to beam search 5. Greedy decoding causes repetition loops ("Monday, Monday, Monday...") on non-English speech. Sori spawns the server with `-bs 5 -bo 5`.
-- **LLM cleanup needs a trap-test and an output guard.** An instruct model will happily *answer* dictation that sounds like a question ("could you use a better model?") instead of cleaning it. Sori wraps input in `<transcript>` tags, frames the model as a transformation function, and structurally validates the output (language match, length ratio, assistant-phrase detection). Any failure falls back to the raw transcript.
-- **Prompt token budget is real.** Whisper keeps only the last ~223 prompt tokens, and dense proper-noun vocabulary tokenizes at ~2.4 chars/token, not 4. A long glossary silently cuts your names hint off the head of the prompt.
+**Whisper keeps only the last 223 prompt tokens, and proper nouns tokenize at ~2.4 chars each, not 4.** My "under the limit" glossary was silently cutting the names hint off the head of the prompt on every single dictation.
 
-## Stable code signing (recommended)
+## Rebuilding without losing permissions
 
-macOS ties permission grants (Accessibility, Input Monitoring) to the app's code signature. With ad-hoc signing, every rebuild invalidates them. Create a self-signed code-signing certificate named `Sori Codesign` in Keychain Access (Certificate Assistant > Create a Certificate > Code Signing) and `install.sh` uses it automatically. Grants then survive rebuilds. After switching identities once, reset stale grants: `tccutil reset Accessibility dev.sori.app && tccutil reset ListenEvent dev.sori.app`, then relaunch.
+macOS ties Accessibility/Input Monitoring grants to the code signature, and ad-hoc signatures change on every build. If you hack on the source, create a self-signed code-signing cert named `Sori Codesign` in Keychain Access; `install.sh` picks it up and your grants survive rebuilds. After the identity switch, clear the stale grants once: `tccutil reset Accessibility dev.sori.app && tccutil reset ListenEvent dev.sori.app`.
 
-## Requirements
+## Requirements and credits
 
-- Apple Silicon or Intel Mac, macOS 13+
-- Xcode Command Line Tools and Homebrew
-- About 2 GB of disk for models, and about 1.7 GB of RAM while the warm engine is loaded (set `warmEngine` to false to run without it)
+macOS 13+, Command Line Tools, Homebrew, ~2 GB disk for models, ~1.7 GB RAM while the warm engine is up (`warmEngine: false` to go without). Built on [whisper.cpp](https://github.com/ggml-org/whisper.cpp). One Swift file, no Xcode project, no dependencies beyond whisper-cpp itself.
 
-## Credits
-
-Built on [whisper.cpp](https://github.com/ggml-org/whisper.cpp) by Georgi Gerganov and OpenAI's Whisper models. Optional cleanup via [Groq](https://groq.com).
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+MIT.
