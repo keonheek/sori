@@ -23,7 +23,7 @@ Either way, macOS will ask for Microphone, Accessibility, and Input Monitoring. 
 
 Hold Right ⌘ and talk, or tap it to toggle. Enter while recording stops, transcribes, pastes, and submits. Escape cancels. The pasted text stays on the clipboard so ⌘V recovers it if it landed in the wrong window.
 
-Dictation comes out cleaned: fillers ("um", "음", "어") stripped and self-corrections resolved to what you meant ("목요일에... 아니다, 금요일에" pastes as 금요일에). The rule-based pass is local. There's a second, optional pass through an LLM on Groq's free tier — put a [free API key](https://console.groq.com) in `~/.sori-groq` and flip "AI Cleanup" in the menu. If the model misbehaves, a guard throws its output away and pastes your raw words instead.
+Dictation comes out cleaned: fillers ("um", "음", "어") stripped and self-corrections resolved to what you meant ("목요일에... 아니다, 금요일에" pastes as 금요일에). The rule-based pass is local. There's a second, optional pass through an LLM on Groq's free tier: put a [free API key](https://console.groq.com) in `~/.sori-groq` and flip "AI Cleanup" in the menu. If the model misbehaves, a guard throws its output away and pastes your raw words instead.
 
 Fix a mis-heard word once (select the correction, ⌘C) and Sori remembers the replacement.
 
