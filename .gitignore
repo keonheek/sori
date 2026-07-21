@@ -2,3 +2,4 @@
 Sori
 *.o
 AppIcon.iconset/
+build/

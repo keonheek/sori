@@ -25,6 +25,10 @@ Most Whisper-based dictation tools break on bilingual speakers. Speak Korean wit
 
 ## Install
 
+**Option A, prebuilt app:** grab `Sori-1.0.0.zip` from [Releases](https://github.com/keonheek/sori/releases), unzip, move to `/Applications`, and right-click > Open on first launch. Then install the engine and models (step 4 in the release notes).
+
+**Option B, build from source:**
+
 ```bash
 git clone https://github.com/keonheek/sori && cd sori
 ./install.sh
