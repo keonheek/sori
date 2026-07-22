@@ -55,6 +55,18 @@ Four problems that shaped the architecture, documented because they will bite an
 - **An instruct LLM will answer dictation that sounds like a request** instead of cleaning it, replying "I can clean up the text for you..." straight into the text field. Prompt framing (transcript in tags, model as pure transform) helps, but the reliable fix is structural output validation: same language as input, sane length ratio, no assistant phrases. Any failure falls back to the raw transcript.
 - **Whisper keeps only the last 223 prompt tokens**, and dense proper nouns tokenize at ~2.4 chars each, not 4. A long glossary silently cuts the names hint off the head of the prompt.
 
+## Windows (experimental)
+
+The `windows/` folder has a Python port with the same pipeline: prompt-free language pre-detection, beam-search transcription via faster-whisper, and the guarded LLM cleanup. Hold Right Ctrl instead of Right ⌘.
+
+```
+cd windows
+pip install -r requirements.txt
+python sori_win.py
+```
+
+The transcription engine is tested (same Korean/English/mixed suite as the macOS app); the hotkey and paste layer has not been verified on real Windows hardware yet, which is why this stays marked experimental. If you run it, an issue with your results (working or not) genuinely helps.
+
 ## Rebuilding without losing permissions
 
 macOS ties Accessibility/Input Monitoring grants to the code signature, and ad-hoc signatures change every build. If you hack on the source, create a self-signed cert named `Sori Codesign` in Keychain Access; `install.sh` picks it up and grants survive rebuilds. After switching identities, reset stale grants once: `tccutil reset Accessibility dev.sori.app && tccutil reset ListenEvent dev.sori.app`.
