@@ -4,7 +4,17 @@ import Carbon.HIToolbox   // IsSecureEventInputEnabled — detect the stuck-secu
 import IOKit.hid          // IOHIDRequestAccess — Input Monitoring (kTCCServiceListenEvent)
 
 // MARK: - Logging
-let logPath = "/tmp/sori.log"
+// All working files live in the per-user private temp dir (mode 0700), never
+// world-writable /tmp — a fixed predictable /tmp path can be pre-planted as a
+// symlink by any other process running as this user (CWE-59).
+let soriWorkDir: String = {
+    let d = (NSTemporaryDirectory() as NSString).appendingPathComponent("sori")
+    try? FileManager.default.createDirectory(atPath: d, withIntermediateDirectories: true,
+                                             attributes: [.posixPermissions: 0o700])
+    return d
+}()
+func workPath(_ name: String) -> String { (soriWorkDir as NSString).appendingPathComponent(name) }
+let logPath = workPath("sori.log")
 let wlogDF: DateFormatter = {
     let d = DateFormatter(); d.dateFormat = "MM-dd HH:mm:ss.SSS"; return d
 }()
@@ -174,6 +184,17 @@ enum TextCleanup {
 
 // MARK: - Tier 2 cleanup via Claude API (optional; grammar + redundancy rewrite)
 // Synchronous, short timeout, graceful fallback to nil so the rule-based result stands.
+
+// Homebrew's prefix differs by architecture: /opt/homebrew on Apple Silicon,
+// /usr/local on Intel. Resolve once per call; hardcoding the Apple Silicon
+// path crashed Intel Macs (Process.launch throws ObjC on a missing binary).
+func whisperTool(_ name: String) -> String {
+    for p in ["/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)"] {
+        if FileManager.default.fileExists(atPath: p) { return p }
+    }
+    return "/opt/homebrew/bin/\(name)"
+}
+
 // Groq (free tier) — the $0 rule bans the paid Anthropic API in local tooling.
 // Key from GROQ_API_KEY env or ~/.sori-groq (chmod 600).
 enum LLMCleanup {
@@ -321,10 +342,10 @@ enum WhisperServer {
         }
         // A spawn may still be loading the model (health fails during load) — don't stack a second.
         if let p = proc, p.isRunning { return }
-        guard FileManager.default.fileExists(atPath: "/opt/homebrew/bin/whisper-server"),
+        guard FileManager.default.fileExists(atPath: whisperTool("whisper-server")),
               FileManager.default.fileExists(atPath: modelPath) else { return }
         let t = Process()
-        t.launchPath = "/opt/homebrew/bin/whisper-server"
+        t.launchPath = whisperTool("whisper-server")
         // -bs/-bo: whisper-server DEFAULTS to greedy decoding (beam -1, best-of 2) while
         // whisper-cli defaults to beam search 5/5. Greedy caused a live repetition-loop
         // mistranscription ("발표는 목요일에" -> "Bullet is not Monday, Monday, Monday...",
@@ -386,7 +407,7 @@ class AudioRecorder {
     private let engine = AVAudioEngine()
     private var audioFile: AVAudioFile?
     private var converter: AVAudioConverter?
-    private let outputURL = URL(fileURLWithPath: "/tmp/sori.wav")
+    private let outputURL = URL(fileURLWithPath: workPath("sori.wav"))
     private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
                                              sampleRate: 16000, channels: 1, interleaved: true)!
     var onLevel: ((Float) -> Void)?
@@ -1244,7 +1265,8 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
         sectionHeader("About", p, H - 56)
         let txt = NSTextField(wrappingLabelWithString:
             "Sori — local, private speech-to-text.\n\n" +
-            "Powered by whisper.cpp running entirely on your Mac. Nothing is sent to the cloud.\n\n" +
+            "Powered by whisper.cpp running entirely on your Mac. Audio never leaves this machine. "
+            + "If the optional AI Cleanup is enabled, transcript TEXT is sent to Groq for cleanup.\n\n" +
             "Hold Right ⌘ to talk, or tap to toggle. Text is pasted at your cursor.")
         txt.font = .systemFont(ofSize: 13); txt.frame = NSRect(x: 28, y: H - 200, width: p.bounds.width - 80, height: 120)
         p.addSubview(txt)
@@ -1704,12 +1726,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         t.schedule(deadline: .now() + 1.0, repeating: 1.2)
         t.setEventHandler { [weak self] in
             guard let self, self.isRecording, !self.partialRunning else { return }
-            let wav = "/tmp/sori.wav"
+            let wav = workPath("sori.wav")
             guard FileManager.default.fileExists(atPath: wav),
                   let sz = try? FileManager.default.attributesOfItem(atPath: wav)[.size] as? Int,
                   (sz ?? 0) > 16000 else { return }   // need ~0.5s of audio
             self.partialRunning = true
-            let snap = "/tmp/sori_partial.wav"
+            let snap = workPath("sori_partial.wav")
             // The live WAV's header is not finalized while recording (AVAudioFile only writes
             // the real length on close), so a plain copy has a 0-length header that whisper
             // reads as empty. Rebuild a VALID header around the raw PCM bytes instead.
@@ -1721,11 +1743,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 wlog("partial model missing: \(pm)"); self.partialRunning = false; return
             }
             let task = Process()
-            task.launchPath = "/opt/homebrew/bin/whisper-cli"
-            task.arguments = ["-m", model, "-l", self.cfg.lang, "-nt", "-otxt", "-of", "/tmp/sori_partial", snap]
+            task.launchPath = whisperTool("whisper-cli")
+            task.arguments = ["-m", model, "-l", self.cfg.lang, "-nt", "-otxt", "-of", workPath("sori_partial"), snap]
             task.standardError = Pipe(); task.standardOutput = Pipe()
-            task.launch(); task.waitUntilExit()
-            let txt = (try? String(contentsOfFile: "/tmp/sori_partial.txt", encoding: .utf8))?
+            do { try task.run() } catch { wlog("partial whisper launch failed: \(error)"); self.partialRunning = false; return }
+            task.waitUntilExit()
+            let txt = (try? String(contentsOfFile: workPath("sori_partial.txt"), encoding: .utf8))?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             wlog("partial: \"\(txt.prefix(60))\"")
             if self.isRecording, !txt.isEmpty { self.panel.setPartial(txt) }
@@ -1789,7 +1812,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Move the WAV to a unique path BEFORE queueing: a new recording restarts
             // /tmp/sori.wav immediately, which would clobber the file while a
             // still-running whisper reads it (transcription is async now).
-            let unique = "/tmp/sori_\(UInt64(Date().timeIntervalSince1970 * 1000)).wav"
+            let unique = workPath("sori_\(UInt64(Date().timeIntervalSince1970 * 1000)).wav")
             do { try FileManager.default.moveItem(atPath: url.path, toPath: unique) }
             catch { wlog("WAV move FAILED: \(error)") }
             self.transcribeQueue.async {
@@ -1817,7 +1840,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let base = (NSHomeDirectory() as NSString).appendingPathComponent(".sori-models/ggml-base.bin")
         guard FileManager.default.fileExists(atPath: base) else { return nil }
         let t = Process()
-        t.launchPath = "/opt/homebrew/bin/whisper-cli"
+        t.launchPath = whisperTool("whisper-cli")
         t.arguments = ["-m", base, "-l", "auto", "-dl", wav]
         let err = Pipe(); t.standardError = err; t.standardOutput = Pipe()
         do { try t.run() } catch { return nil }
@@ -1833,7 +1856,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Clear the previous output FIRST: whisper-cli exits 0 without touching -of
             // when the input is missing/empty, and a stale out.txt would paste the
             // PREVIOUS session's transcript again.
-            try? FileManager.default.removeItem(atPath: "/tmp/sori_out.txt")
+            try? FileManager.default.removeItem(atPath: workPath("sori_out.txt"))
             guard FileManager.default.fileExists(atPath: url.path) else {
                 wlog("transcribe ABORT — WAV missing at \(url.path)")
                 DispatchQueue.main.async {
@@ -1860,17 +1883,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             if !viaServer {
-                var args = ["-m", model, "-l", lang, "-otxt", "-of", "/tmp/sori_out", url.path]
+                var args = ["-m", model, "-l", lang, "-otxt", "-of", workPath("sori_out"), url.path]
                 if !prompt.isEmpty {
                     args += ["--prompt", prompt]   // bias whisper toward names + modern AI terms
                 }
                 wlog("whisper args: \(args.joined(separator: " "))")
                 let task = Process()
-                task.launchPath = "/opt/homebrew/bin/whisper-cli"; task.arguments = args
+                task.launchPath = whisperTool("whisper-cli"); task.arguments = args
                 let pipe = Pipe(); task.standardError = pipe
-                task.launch(); task.waitUntilExit()
+                do { try task.run() } catch { wlog("whisper-cli launch failed: \(error)") }
+                task.waitUntilExit()
 
-                text = (try? String(contentsOfFile: "/tmp/sori_out.txt", encoding: .utf8))?
+                text = (try? String(contentsOfFile: workPath("sori_out.txt"), encoding: .utf8))?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             }
             let raw = text

@@ -23,7 +23,11 @@ dl() {
     local f="$1"
     [ -f "$MODELS/$f" ] && { echo "-- $f already present"; return; }
     echo "-- Downloading $f ..."
-    curl -L --progress-bar -o "$MODELS/$f" "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$f"
+    # -f: fail on HTTP errors instead of saving the error page as a "model".
+    # .tmp + mv: an interrupted download never leaves a truncated file at the
+    # final path (which would pass the existence check above forever).
+    curl -fL --progress-bar -o "$MODELS/$f.tmp" "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$f"
+    mv "$MODELS/$f.tmp" "$MODELS/$f"
 }
 dl ggml-base.bin
 dl ggml-large-v3-turbo.bin
