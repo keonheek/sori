@@ -34,7 +34,7 @@ dl ggml-large-v3-turbo.bin
 
 # 3. Build
 echo "-- Building..."
-swiftc -O main.swift -o Sori
+swiftc -O -target "$(uname -m)-apple-macos11.0" main.swift -o Sori
 
 # 4. Assemble the app bundle
 echo "-- Assembling $APP ..."

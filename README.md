@@ -65,7 +65,7 @@ pip install -r requirements.txt
 python sori_win.py
 ```
 
-The transcription engine is tested (same Korean/English/mixed suite as the macOS app); the hotkey and paste layer has not been verified on real Windows hardware yet, which is why this stays marked experimental. If you run it, an issue with your results (working or not) genuinely helps.
+The transcription engine was validated against the same Korean/English/mixed audio used while building the macOS app (the suite itself is not yet committed); the hotkey and paste layer has not been verified on real Windows hardware yet, which is why this stays marked experimental. If you run it, an issue with your results (working or not) genuinely helps.
 
 ## Rebuilding without losing permissions
 

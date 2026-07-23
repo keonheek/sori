@@ -10,6 +10,10 @@ Deps: pip install -r requirements.txt   (faster-whisper, sounddevice, keyboard, 
 
 Status: EXPERIMENTAL. The transcription pipeline is tested; the Windows hotkey
 and paste layer has not been verified on real hardware yet. Issues welcome.
+
+Known Windows caveats: the keyboard hook may require running elevated on some
+setups, and pasting into an elevated (admin) window is silently blocked by
+Windows UIPI — the text is still on the clipboard, paste manually with Ctrl+V.
 """
 
 import json
@@ -64,21 +68,29 @@ def load_conf():
         conf.update({k: v for k, v in on_disk.items() if k in DEFAULTS and v is not None})
     except (OSError, json.JSONDecodeError):
         pass
+    # The conf file is shared with the macOS app, which stores whisper.cpp GGML
+    # filenames ("ggml-large-v3-turbo.bin"). faster-whisper wants plain ids.
+    for key in ("model", "detectModel"):
+        m = conf[key]
+        if m.startswith("ggml-") or m.endswith(".bin"):
+            conf[key] = m.removeprefix("ggml-").removesuffix(".bin")
     return conf
 
 
 def build_prompt(conf):
-    parts = []
-    terms = conf["aiTerms"].strip()
-    if terms:
-        parts.append(f"Glossary: {terms}.")
-    names = conf["promptHint"].strip()
-    if names:
-        parts.append(f"Names: {names}.")
-    parts.append(STYLE_ANCHOR)
     # Whisper keeps only the LAST ~223 prompt tokens and drops the head, so the
-    # glossary (first) is sacrificial and the style anchor (last) always survives.
-    return " ".join(parts)[:480]
+    # glossary must be the sacrificial part: trim IT to fit, never the names
+    # hint or the style anchor at the tail (a naive left-slice would keep the
+    # glossary and drop exactly the parts that matter).
+    names = conf["promptHint"].strip()
+    names_part = f"Names: {names}." if names else ""
+    glossary = conf["aiTerms"].strip()
+    glossary_part = f"Glossary: {glossary}." if glossary else ""
+    cap = 480
+    room = cap - len(names_part) - len(STYLE_ANCHOR) - 2
+    if len(glossary_part) > room:
+        glossary_part = "" if room <= 20 else glossary_part[:room].rsplit(",", 1)[0] + "."
+    return " ".join(p for p in (glossary_part, names_part, STYLE_ANCHOR) if p)
 
 # ---------------------------------------------------------------- recording
 
@@ -156,10 +168,20 @@ class Engine:
 # ---------------------------------------------------------------- cleanup
 
 SILENCE_ARTIFACTS = {
-    "[blank_audio]", "(silence)", "[silence]", "[music]", "(music)", "thank you",
-    "thanks for watching", "please subscribe", "you", "bye", "okay", "ok", "so",
-    "uh", "um", "mm", "♪",
+    "[blank_audio]", "(silence)", "[silence]", "[ silence ]", "[music]", "(music)",
+    "thank you", "thank you so much", "thanks for watching", "please subscribe",
+    "you", "bye", "bye-bye", "okay", "ok", "so", "uh", "um", "mm",
+    "subtitles by", "transcription by", "amara.org", "♪",
 }
+
+
+def is_prompt_echo(norm):
+    """On blank audio whisper sometimes continues the PROMPT instead of
+    transcribing — empirically it pastes the style anchor's tail on about half
+    of accidental blank recordings. Suppress anchor fragments and leaked
+    section labels (same guard as the macOS app)."""
+    return ((len(norm) >= 6 and norm in STYLE_ANCHOR.lower())
+            or norm.startswith("names:") or norm.startswith("glossary:"))
 
 CLEANUP_SYSTEM = (
     "You are a text-transformation FUNCTION, not an assistant. The user message is a raw "
@@ -208,7 +230,12 @@ def llm_cleanup(text):
             key = f.read().strip()
     except OSError:
         return None
-    if not key or len(text.split()) < 5:
+    # Gate on words that aren't pure fillers — the macOS app counts after its
+    # rule-based filler strip, so a filler-heavy short utterance shouldn't
+    # trigger the network call here either.
+    real_words = [w for w in text.split() if w.strip(".,!?").lower() not in
+                  {"um", "uh", "er", "ah", "mm", "음", "어", "그"}]
+    if not key or len(real_words) < 5:
         return None
     body = json.dumps({
         "model": "openai/gpt-oss-120b", "temperature": 0, "max_tokens": 1024,
@@ -249,25 +276,49 @@ def main():
     last_paste = {"end": "", "at": 0.0}
 
     def start(_=None):
+        # Runs on the keyboard hook thread: must be fast and must never raise
+        # (an uncaught exception silently kills the hook = hotkey dead forever).
         if recording.is_set():
-            return
-        recording.set()
-        rec.start()
-        print("● recording... (release to transcribe)")
+            return   # auto-repeat fires this repeatedly while the key is held
+        try:
+            recording.set()
+            rec.start()
+            print("● recording... (release to transcribe)")
+        except Exception as e:
+            recording.clear()
+            print(f"! could not start recording: {e}")
 
     def stop_and_transcribe(_=None):
         if not recording.is_set():
             return
         recording.clear()
-        wav = rec.stop()
+        try:
+            wav = rec.stop()
+        except Exception as e:
+            print(f"! recorder stop failed: {e}")
+            return
         if not wav:
             print("(too short, ignored)")
             return
+        # Transcription takes seconds — NEVER run it on the keyboard hook
+        # thread: Windows silently unhooks a low-level hook whose callback
+        # stalls, killing the hotkey until restart. Hand off immediately.
+        threading.Thread(target=_transcribe_job, args=(wav,), daemon=True).start()
+
+    def _transcribe_job(wav):
         t0 = time.time()
-        text = engine.transcribe(wav)
-        os.unlink(wav)
+        try:
+            text = engine.transcribe(wav)
+        except Exception as e:
+            print(f"! transcription failed: {e}")
+            return
+        finally:
+            try:
+                os.unlink(wav)
+            except OSError:
+                pass
         norm = re.sub(r"[\s.,!?\-—\"]+$", "", re.sub(r"^[\s.,!?\-—\"]+", "", text.lower()))
-        if not norm or norm in SILENCE_ARTIFACTS:
+        if not norm or norm in SILENCE_ARTIFACTS or is_prompt_echo(norm):
             print("(no speech)")
             return
         text = re.sub(r"\s{2,}", " ", text.replace("\n", " ")).strip()
