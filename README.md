@@ -4,7 +4,7 @@
   <p><strong>Push-to-talk dictation for macOS that handles Korean, English, and code-switching between them.</strong></p>
 
   [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-  ![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-brightgreen)
+  ![Platform](https://img.shields.io/badge/platform-macOS%2011%2B-brightgreen)
   [![Release](https://img.shields.io/github/v/release/keonheek/sori)](https://github.com/keonheek/sori/releases)
 
   <a href="https://github.com/keonheek/sori/releases"><strong>Download</strong></a>
@@ -73,7 +73,7 @@ macOS ties Accessibility/Input Monitoring grants to the code signature, and ad-h
 
 ## Requirements
 
-macOS 13+ · Xcode Command Line Tools · Homebrew · ~2 GB disk for models · ~1.7 GB RAM while the warm engine is loaded (`warmEngine: false` to go without)
+macOS 11+ (universal: Apple Silicon and Intel) · Xcode Command Line Tools · Homebrew · ~2 GB disk for models · ~1.7 GB RAM while the warm engine is loaded (`warmEngine: false` to go without)
 
 Built on [whisper.cpp](https://github.com/ggml-org/whisper.cpp). One Swift file, no Xcode project, no dependencies beyond whisper-cpp itself.
 
