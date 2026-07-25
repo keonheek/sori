@@ -6,6 +6,10 @@ APP="/Applications/Sori.app"
 MODELS="$HOME/.sori-models"
 LABEL="dev.sori.app"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Single source of truth for the version: the `let soriVersion` line in main.swift.
+VERSION="$(sed -n 's/^let soriVersion = "\(.*\)"/\1/p' "$SRC/main.swift")"
+[ -n "$VERSION" ] || { echo "ERROR: could not read soriVersion from main.swift"; exit 1; }
 
 echo "== Sori installer =="
 
@@ -53,7 +57,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST_EOF
     <key>CFBundleExecutable</key><string>Sori</string>
     <key>CFBundleIdentifier</key><string>$LABEL</string>
     <key>CFBundleName</key><string>Sori</string>
-    <key>CFBundleVersion</key><string>1.0</string>
+    <key>CFBundleVersion</key><string>$VERSION</string>
+    <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>LSUIElement</key><true/>
     <key>NSMicrophoneUsageDescription</key><string>Used for speech-to-text dictation.</string>
@@ -87,7 +92,11 @@ else
     echo "   See README 'Stable code signing' to fix this permanently."
 fi
 
-# 6. Launch agent (start at login)
+# 6. Record where this source lives, so the app's "Check for Updates…" knows it can pull and
+# rebuild in place (and therefore keep your permissions) instead of sending you to a download.
+printf '%s\n' "$SRC" > "$HOME/.sori-src"
+
+# 7. Launch agent (start at login)
 cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -103,9 +112,22 @@ pkill -f "$APP/Contents/MacOS/Sori" 2>/dev/null || true
 pkill -f "whisper-server.*--port 8917" 2>/dev/null || true
 sleep 1
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
-
-echo ""
-echo "== Done. Sori is running (menu-bar mic icon). =="
+# bootstrap REGISTERS the job; RunAtLoad does not reliably start it right after a bootout
+# (observed: bootstrap returns 0, `launchctl print` shows runs = 0, and nothing runs until the
+# next login). Start it explicitly, then trust only launchd's own view — pgrep would happily
+# match an orphaned older process and report a false success.
+launchctl kickstart "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+sleep 2
+if launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -q "state = running"; then
+    echo ""
+    echo "== Done. Sori $VERSION is running (menu-bar mic icon). =="
+else
+    echo ""
+    echo "== Installed, but Sori is NOT running. =="
+    echo "   Start it with: launchctl kickstart -k gui/$(id -u)/$LABEL"
+    echo "   If that fails, check the log: tail \$(getconf DARWIN_USER_TEMP_DIR)sori/sori.log"
+    exit 1
+fi
 echo ""
 echo "First-time setup — grant these in System Settings > Privacy & Security:"
 echo "  1. Microphone            (prompted automatically on first recording)"
