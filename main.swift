@@ -411,9 +411,14 @@ class AudioRecorder {
     private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
                                              sampleRate: 16000, channels: 1, interleaved: true)!
     var onLevel: ((Float) -> Void)?
+    // Noise floor for the level meter, in dBFS, learned per recording (see the tap below).
+    // NaN = "not seeded yet"; the first buffer of each recording seeds it.
+    private var floorDb: Float = .nan
+    private var loggedBufferSize = false
 
     func start() {
         try? FileManager.default.removeItem(at: outputURL)
+        floorDb = .nan; loggedBufferSize = false
         let input = engine.inputNode
         let inFormat = input.inputFormat(forBus: 0)
         wlog("recorder.start sr=\(inFormat.sampleRate) ch=\(inFormat.channelCount)")
@@ -426,11 +431,12 @@ class AudioRecorder {
 
         input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { [weak self] buf, _ in
             guard let self else { return }
+            if !self.loggedBufferSize { self.loggedBufferSize = true; wlog("tap buffer frames=\(buf.frameLength)") }
             if let ch = buf.floatChannelData?[0] {
                 let n = Int(buf.frameLength); var sum: Float = 0
                 for i in 0..<n { sum += ch[i] * ch[i] }
                 let rms = n > 0 ? sqrtf(sum / Float(n)) : 0
-                self.onLevel?(min(1.0, rms * 8.0))
+                self.onLevel?(self.displayLevel(rms))
             }
             guard let conv = self.converter, let file = self.audioFile else { return }
             let ratio = self.targetFormat.sampleRate / inFormat.sampleRate
@@ -444,6 +450,31 @@ class AudioRecorder {
             if outBuf.frameLength > 0 { try? file.write(from: outBuf) }
         }
         do { try engine.start(); wlog("engine started") } catch { wlog("engine.start FAILED: \(error)") }
+    }
+
+    // Map a raw buffer RMS to the 0...1 the meters draw. Amplitude-domain scaling (the old
+    // `min(1, rms * 8)`) is the wrong shape for this: measured on a real 51s recording of this
+    // mic, speech RMS lands around -45 dBFS and the silence floor around -64 dBFS, so `rms * 8`
+    // produced 0.03...0.05 — the bars never left the bottom fifth of their range no matter how
+    // loud he spoke. Hearing is logarithmic, so map in dB instead, from a per-recording noise
+    // floor up a fixed span, which also makes the meter mic-independent.
+    private func displayLevel(_ rms: Float) -> Float {
+        let db = 20 * log10f(max(rms, 1e-7))
+        if floorDb.isNaN { floorDb = db }
+        // The floor may snap DOWN quickly but must never be dragged UP by speech — a floor that
+        // rises while he talks would shrink the meter the longer the sentence runs. Only frames
+        // already near the floor (i.e. actual room tone) are allowed to raise it, and slowly.
+        if db < floorDb {
+            floorDb += 0.30 * (db - floorDb)
+        } else if db < floorDb + 6 {
+            floorDb += 0.02 * (db - floorDb)
+        }
+        floorDb = min(max(floorDb, -75), -40)
+        // +6 dB of dead-band so room tone still reads as silence, then 24 dB of span to full
+        // scale. Tuned by replaying a real recording through this exact function: speech lands
+        // around 0.73 with peaks touching 1.0 and only ~2% of speaking frames pinned at the top,
+        // so the bars swing instead of either hugging the floor (the old bug) or saturating.
+        return max(0, min(1, (db - (floorDb + 6)) / 24))
     }
 
     func stop(completion: @escaping (URL) -> Void) {
@@ -533,54 +564,66 @@ final class LevelBarsView: NSView {
     // bar-to-bar so a real transient visibly ripples through the cluster instead of all 5 jumping
     // in lockstep. This is a single scalar mic level, not real per-band audio data, so decorrelated
     // per-bar TIMING is what has to stand in for genuine frequency-band independence.
+    //
+    // The rates are TIME CONSTANTS in seconds, not per-callback fractions: the audio tap's buffer
+    // size is a hint the system is free to ignore, so a per-callback rate silently changes the
+    // ballistics with the hardware. These taus reproduce the original per-push rates at the
+    // nominal ~48 Hz callback but now hold at any callback rate.
     private var smoothed: [CGFloat] = []
+    private var lastPush: CFTimeInterval = 0
     private let responses:    [CGFloat] = [0.88, 1.0, 0.82, 0.95, 0.9]
-    private let attackRates:  [CGFloat] = [0.45, 0.85, 0.6, 0.95, 0.55]
-    private let releaseRates: [CGFloat] = [0.05, 0.13, 0.07, 0.16, 0.08]
+    private let attackTaus:   [CGFloat] = [0.035, 0.011, 0.023, 0.007, 0.026]
+    private let releaseTaus:  [CGFloat] = [0.41, 0.15, 0.29, 0.12, 0.25]
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard bars.isEmpty, window != nil else { return }
         wantsLayer = true
         let n = responses.count
         smoothed = Array(repeating: 0, count: n)
-        let barW: CGFloat = 3.5, gap: CGFloat = 2
+        let barW: CGFloat = 4, gap: CGFloat = 2.5
         let total = CGFloat(n) * barW + CGFloat(n - 1) * gap
         let startX = bounds.midX - total / 2
         maxH = max(8, bounds.height - 2)   // use nearly the full box height
         minH = max(2, maxH * 0.06)         // near-zero baseline -> maximum visible swing
         for i in 0..<n {
             let l = CALayer()
-            l.backgroundColor = NSColor.white.withAlphaComponent(0.92).cgColor
+            l.backgroundColor = NSColor.white.cgColor
             l.cornerRadius = 1.0   // rounded RECTANGLE, not a pill/oval (feedback, 2026-07-09)
             l.frame = CGRect(x: startX + CGFloat(i) * (barW + gap), y: bounds.midY - minH / 2, width: barW, height: minH)
             layer?.addSublayer(l); bars.append(l)
         }
     }
-    private func setBarHeight(_ i: Int, _ h: CGFloat) {
+    private func setBarHeight(_ i: Int, _ h: CGFloat, _ dur: CFTimeInterval = 0.08) {
         let l = bars[i]
         let anim = CABasicAnimation(keyPath: "bounds.size.height")
         anim.fromValue = l.bounds.height; anim.toValue = h
-        anim.duration = 0.08; anim.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        anim.duration = dur; anim.timingFunction = CAMediaTimingFunction(name: .easeOut)
         l.bounds = CGRect(x: 0, y: 0, width: l.bounds.width, height: h)
         l.position = CGPoint(x: l.position.x, y: bounds.midY)
         l.add(anim, forKey: "h")
     }
-    // level is the same 0.06...1.0-ish range WaveView already consumes from recorder.onLevel.
-    // sqrt() expands the quiet-to-moderate range where raw RMS-derived levels actually live (still
-    // "a bit subtle" after a flat ×2 gain, per follow-up feedback) — sqrt(0.16)=0.4, sqrt(0.64)=0.8,
-    // so normal speech now swings through most of the bar's range instead of hugging the bottom.
+    // level is the 0...1 the recorder already normalised against this recording's own noise floor
+    // (see AudioRecorder.displayLevel). No curve is applied here any more: the old sqrt(level)*1.5
+    // existed only to rescue an amplitude-domain level that hugged the bottom of the range, and
+    // stacking it on top of a dB-mapped level would just peg every bar near full height.
     func push(_ level: CGFloat) {
         guard !bars.isEmpty else { return }
-        let shaped = max(0, min(1, sqrt(max(0, level)) * 1.5))
+        let now = CACurrentMediaTime()
+        // First push of a recording has no meaningful dt; clamp so a stalled tap can't teleport.
+        let dt = lastPush == 0 ? 0.02 : min(0.2, max(0.001, now - lastPush))
+        lastPush = now
+        let shaped = max(0, min(1, level))
         for i in 0..<bars.count {
             let target = max(0, min(1, shaped * responses[i]))
-            let rate = target > smoothed[i] ? attackRates[i] : releaseRates[i]
-            smoothed[i] += rate * (target - smoothed[i])
-            setBarHeight(i, minH + smoothed[i] * (maxH - minH))
+            let tau = target > smoothed[i] ? attackTaus[i] : releaseTaus[i]
+            let k = 1 - exp(-CGFloat(dt) / tau)
+            smoothed[i] += k * (target - smoothed[i])
+            setBarHeight(i, minH + smoothed[i] * (maxH - minH), min(0.1, max(0.016, dt)))
         }
     }
     func reset() {
         guard !bars.isEmpty else { return }
+        lastPush = 0
         for i in 0..<bars.count { smoothed[i] = 0; setBarHeight(i, minH) }
     }
 }
