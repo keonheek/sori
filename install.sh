@@ -36,7 +36,11 @@ dl ggml-large-v3-turbo.bin
 echo "-- Building..."
 swiftc -O -target "$(uname -m)-apple-macos11.0" main.swift -o Sori
 
-# 4. Assemble the app bundle
+# 4. Assemble the app bundle.
+# Read the existing install's signing identity BEFORE overwriting it — step 5 falls back
+# to this so a rebuild can't silently downgrade a properly signed app to ad-hoc.
+# Empty for a first install or an ad-hoc one (no Authority line in that case).
+PREV_IDENTITY="$(codesign -dvvv "$APP" 2>&1 | awk -F= '/^Authority=/{print $2; exit}' || true)"
 echo "-- Assembling $APP ..."
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 rm -f "$APP/Contents/MacOS/Sori"
@@ -60,9 +64,23 @@ PLIST_EOF
 # 5. Codesign. Ad-hoc works, but macOS revokes permissions on every rebuild with
 # ad-hoc signatures. For a stable setup, create a self-signed identity named
 # "Sori Codesign" in Keychain Access (see README) — the installer uses it if present.
-if security find-identity -v -p codesigning 2>/dev/null | grep -q "Sori Codesign"; then
-    codesign --force --sign "Sori Codesign" "$APP"
+# Override the name with SORI_CODESIGN_IDENTITY. If neither is found but an earlier
+# install was signed with some identity, reuse THAT one: re-signing an installed app
+# ad-hoc silently revokes its Microphone / Accessibility / Input Monitoring grants,
+# and a rebuild is the worst possible moment to discover that.
+sign_with() { codesign --force --sign "$1" "$APP"; }
+if [ -n "${SORI_CODESIGN_IDENTITY:-}" ] \
+   && security find-identity -v -p codesigning 2>/dev/null | grep -qF "$SORI_CODESIGN_IDENTITY"; then
+    sign_with "$SORI_CODESIGN_IDENTITY"
+    echo "-- Signed with '$SORI_CODESIGN_IDENTITY' (from SORI_CODESIGN_IDENTITY)"
+elif security find-identity -v -p codesigning 2>/dev/null | grep -qF "Sori Codesign"; then
+    sign_with "Sori Codesign"
     echo "-- Signed with stable 'Sori Codesign' identity (permissions survive rebuilds)"
+elif [ -n "$PREV_IDENTITY" ] \
+     && security find-identity -v -p codesigning 2>/dev/null | grep -qF "$PREV_IDENTITY"; then
+    sign_with "$PREV_IDENTITY"
+    echo "-- Reused the identity the installed app already had: '$PREV_IDENTITY'"
+    echo "   (keeps your existing permission grants; set SORI_CODESIGN_IDENTITY to change it)"
 else
     codesign --force --sign - "$APP"
     echo "-- Ad-hoc signed. NOTE: you must re-grant permissions after every rebuild."
