@@ -49,11 +49,13 @@ struct Config: Codable {
     var partialModel: String? = nil      // model for live preview (default ggml-base.bin — fast)
     var warmEngine: Bool? = nil          // keep whisper-server resident (model stays in RAM; ~4x faster final transcription). CLI fallback when the server is down.
     var panelStyle: String? = nil        // "classic" (default, full preview) or "compact" (thin floating indicator)
-    // Position as a FRACTION (0...1) of whichever screen currently hosts it, not absolute screen
-    // coords — so it lands in the same relative spot when it follows the mouse to a different
-    // monitor (each NSScreen has its own origin in the global coordinate space).
-    var compactFracX: Double? = nil
-    var compactFracY: Double? = nil
+    // Hide the compact indicator while everything else keeps working (Right ⌘ still dictates,
+    // the menu-bar icon still shows state). NOT a style switch — style stays "compact"
+    // (feedback 2026-07-27). The old compactFracX/compactFracY position keys are gone: the
+    // indicator is now permanently pinned to bottom-center, so there is nothing to store.
+    // A stale pair left in an existing ~/.sori.conf is ignored by the decoder and dropped
+    // on the next save.
+    var compactHidden: Bool? = nil
 
     // Style anchor appended to every whisper prompt. Whisper mimics the prompt's WRITING
     // STYLE — a punctuated prose prompt yields punctuated output; the old bare comma-list
@@ -405,7 +407,7 @@ enum WhisperServer {
 // MARK: - Version + updates
 // THE single source of truth for the version. install.sh and make-release.sh both grep this
 // line for the bundle plist and the release zip name, so there is exactly one number to bump.
-let soriVersion = "1.0.1"
+let soriVersion = "1.0.2"
 
 // "Check for Updates…" — what it can actually do depends on how Sori was installed, because
 // macOS ties Accessibility/Input Monitoring grants to the code signature:
@@ -764,8 +766,11 @@ final class LevelBarsView: NSView {
 
 // Hover feedback + click-vs-drag detection for the compact panel: hovering shows it's
 // interactive, a plain click starts/stops dictation (an alternative to Right ⌘ — "either"
-// should work, feedback 2026-07-09), and dragging still repositions it. We handle mouseDown/
-// dragged/up ourselves (mouseDownCanMoveWindow = false) instead of NSWindow's automatic
+// should work, feedback 2026-07-09), and a right-click opens the app menu. The indicator no
+// longer MOVES on drag (pinned bottom-center since 2026-07-27), but drag detection stays:
+// a press that slides is not a deliberate click, and the dictation it started must be
+// cancelled rather than pasted. We handle mouseDown/dragged/up ourselves
+// (mouseDownCanMoveWindow = false) instead of NSWindow's automatic
 // isMovableByWindowBackground, because that would swallow the mouseDown before we ever see
 // it — there'd be no way to tell "click" from "drag".
 final class CompactInteractionView: NSView {
@@ -773,10 +778,10 @@ final class CompactInteractionView: NSView {
     var onPressDown: (() -> Void)?
     var onDragDetected: (() -> Void)?          // fires once, the moment a press turns into a drag
     var onPressUp: ((_ wasDrag: Bool) -> Void)?
+    var onRightClick: (() -> Void)?            // context menu; never a dictation press
     override var mouseDownCanMoveWindow: Bool { false }
     private var area: NSTrackingArea?
     private var dragStartMouse: NSPoint = .zero
-    private var dragStartOrigin: NSPoint = .zero
     private var didDrag = false
     // 5pt, not a hair-trigger 2-3pt — a firm trackpad click can carry a few points of finger
     // drift, and misreading that as a drag silently cancels the dictation with no feedback.
@@ -794,7 +799,6 @@ final class CompactInteractionView: NSView {
     override func mouseDown(with event: NSEvent) {
         didDrag = false
         dragStartMouse = NSEvent.mouseLocation
-        dragStartOrigin = window?.frame.origin ?? .zero
         onPressDown?()
     }
     override func mouseDragged(with event: NSEvent) {
@@ -804,11 +808,12 @@ final class CompactInteractionView: NSView {
             didDrag = true
             onDragDetected?()
         }
-        if didDrag {
-            window?.setFrameOrigin(NSPoint(x: dragStartOrigin.x + dx, y: dragStartOrigin.y + dy))
-        }
     }
     override func mouseUp(with event: NSEvent) { onPressUp?(didDrag) }
+    // Deliberately does NOT call super: the default path would try to build a contextual
+    // menu from the view, and it must not go through mouseDown's press/dictation logic
+    // either — a right-click is a menu, never a recording.
+    override func rightMouseDown(with event: NSEvent) { onRightClick?() }
 }
 
 final class RecordingPanel {
@@ -821,15 +826,21 @@ final class RecordingPanel {
     private var generation = 0
 
     // "classic" (this file's original full-preview panel, default) or "compact" (a small
-    // always-visible draggable indicator — see the MARK below). Set by AppDelegate from
-    // Config at launch and whenever Settings is saved.
+    // always-visible indicator pinned bottom-center — see the MARK below). Set by AppDelegate
+    // from Config at launch and whenever Settings is saved.
     var style: String = "classic" { didSet { if style != oldValue { styleChanged() } } }
+
+    // Hide the compact indicator without leaving compact style: the app keeps recording and
+    // pasting, it just draws nothing on screen (feedback 2026-07-27). Set by AppDelegate from
+    // Config at launch and from the "Floating Indicator" menu item.
+    var compactHidden: Bool = false { didSet { if compactHidden != oldValue { hiddenChanged() } } }
 
     // Wired once by AppDelegate so a click on the compact indicator can start/stop dictation
     // the same way Right ⌘ does — RecordingPanel has no idea what "recording" means, it just relays.
     var onCompactPressDown: (() -> Void)?
     var onCompactDragDetected: (() -> Void)?
     var onCompactPressUp: ((_ wasDrag: Bool) -> Void)?
+    var onCompactRightClick: (() -> Void)?
 
     // Real speech (not a blank-audio artifact) → show text; otherwise keep the dots.
     private func isPlaceholder(_ t: String) -> Bool {
@@ -1012,7 +1023,7 @@ final class RecordingPanel {
         win.contentView = c; self.window = win; self.wave = wave; self.label = label; self.dots = dots
     }
 
-    // MARK: - Compact style: a small, always-visible, draggable indicator.
+    // MARK: - Compact style: a small, always-visible indicator pinned to bottom-center.
     // Unlike the classic panel (built fresh per show(), hidden the rest of the time), this
     // window is persistent — up from launch to say "online and available" — and just swaps
     // between an idle (thin line) and active (monochrome level-bars, "recognizing audio")
@@ -1024,30 +1035,52 @@ final class RecordingPanel {
     private var compactHoverBacking: NSView?
     private var compactScreenFollowTimer: Timer?
     private var compactCurrentScreen: NSScreen?
-    // True only while the screen-follow timer's OWN animated move is in flight — the resulting
-    // didMoveNotification must NOT be treated as a user drag (that fired repeatedly mid-animation
-    // and corrupted the persisted fraction; a real drag sets this false so it still persists).
-    private var compactAutoRepositioning = false
     // Apple's point is defined as 1/72 inch (2.54cm) regardless of actual screen PPI —
     // the same convention Preview/Print use for "actual size" — so this is an exact physical
     // conversion, not a guess, and holds at any display's default (non-custom) scaling.
     private static let ptPerCm: CGFloat = 72.0 / 2.54
     private static let compactSize = NSSize(width: 1.5 * ptPerCm, height: 0.7 * ptPerCm)  // ~42.5 x 19.8pt
-    // Default = bottom-center, clear of the Dock — NOT screen-middle (feedback, 2026-07-09: "the
+    // Bottom-center, clear of the Dock — NOT screen-middle (feedback, 2026-07-09: "the
     // default position should be at the bottom mid, not directly the middle... slightly above the
     // Dock"). Same pragmatic fixed-offset approach the classic panel already uses (sf.minY + 90),
     // just expressed as a fraction since compact must also work out on any monitor it follows to.
+    // Since 2026-07-27 this is the ONLY position it ever takes: it "moved out of place a lot"
+    // because system-initiated window moves (display reconfig, monitor sleep/wake) fired the same
+    // didMoveNotification a user drag did, and got persisted as if he had put it there.
     private static let defaultFracX: CGFloat = 0.5
     private static let defaultFracY: CGFloat = 0.06
 
+    private static func pinnedOrigin(on screen: NSRect, size: NSSize) -> NSPoint {
+        NSPoint(x: screen.minX + defaultFracX * screen.width - size.width / 2,
+                y: screen.minY + defaultFracY * screen.height - size.height / 2)
+    }
+
     private func styleChanged() {
         if style == "compact" {
+            guard !compactHidden else { return }   // stays off screen until the menu turns it back on
             if compactWin == nil { buildCompact() }
             showCompactIdle()
             startScreenFollow()
         } else {
             compactWin?.orderOut(nil)
             compactScreenFollowTimer?.invalidate(); compactScreenFollowTimer = nil
+        }
+    }
+
+    private func hiddenChanged() {
+        DispatchQueue.main.async {
+            guard self.style == "compact" else { return }
+            if self.compactHidden {
+                self.compactWin?.orderOut(nil)
+                self.compactScreenFollowTimer?.invalidate(); self.compactScreenFollowTimer = nil
+            } else {
+                if self.compactWin == nil { self.buildCompact() }
+                self.recenterCompact()
+                // orderFrontRegardless, not showCompactIdle: whatever idle/active appearance it
+                // had is still correct — unhiding mid-dictation must not reset it to idle.
+                self.compactWin?.orderFrontRegardless()
+                self.startScreenFollow()
+            }
         }
     }
 
@@ -1065,40 +1098,44 @@ final class RecordingPanel {
             guard let self, let win = self.compactWin else { return }
             guard let screen = Self.screenAt(NSEvent.mouseLocation), screen != self.compactCurrentScreen else { return }
             self.compactCurrentScreen = screen
-            let cfg = Config.load()
-            let fx = CGFloat(cfg.compactFracX ?? Double(Self.defaultFracX))
-            let fy = CGFloat(cfg.compactFracY ?? Double(Self.defaultFracY))
-            let size = win.frame.size
-            let origin = NSPoint(x: screen.frame.minX + fx * screen.frame.width - size.width / 2,
-                                  y: screen.frame.minY + fy * screen.frame.height - size.height / 2)
-            self.compactAutoRepositioning = true
-            NSAnimationContext.runAnimationGroup({ ctx in
+            let origin = Self.pinnedOrigin(on: screen.frame, size: win.frame.size)
+            NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.25
                 win.animator().setFrameOrigin(origin)
-            }, completionHandler: { self.compactAutoRepositioning = false })
+            }
         }
+    }
+
+    // Re-pin to bottom-center of whichever screen it is on now. Called on display
+    // reconfiguration: WindowServer relocates borderless windows on its own when monitors
+    // sleep/wake or resolutions change, and that drift is exactly what used to be mistaken
+    // for the user having moved it (2026-07-27).
+    private func recenterCompact() {
+        guard let win = compactWin else { return }
+        // Only screens that exist RIGHT NOW — a cached NSScreen from before the
+        // reconfiguration can still report its old frame.
+        let screen = Self.screenAt(NSPoint(x: win.frame.midX, y: win.frame.midY))
+                     ?? Self.screenAt(NSEvent.mouseLocation) ?? NSScreen.main
+        guard let sf = screen?.frame else { return }
+        compactCurrentScreen = screen
+        win.setFrameOrigin(Self.pinnedOrigin(on: sf, size: win.frame.size))
     }
 
     private func buildCompact() {
         let size = Self.compactSize
-        let cfg = Config.load()
         let mouseScreen = Self.screenAt(NSEvent.mouseLocation)
         let screen = mouseScreen?.frame ?? NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         compactCurrentScreen = mouseScreen ?? NSScreen.main
-        // Default: bottom-center, clear of the Dock (see defaultFracX/Y above).
-        // Once dragged, the saved fraction wins on every future launch/style-switch/screen-follow.
-        let fx = CGFloat(cfg.compactFracX ?? Double(Self.defaultFracX))
-        let fy = CGFloat(cfg.compactFracY ?? Double(Self.defaultFracY))
-        let x = screen.minX + fx * screen.width - size.width / 2
-        let y = screen.minY + fy * screen.height - size.height / 2
-        let win = NSPanel(contentRect: NSRect(x: x, y: y, width: size.width, height: size.height),
+        let origin = Self.pinnedOrigin(on: screen, size: size)
+        let win = NSPanel(contentRect: NSRect(origin: origin, size: size),
                            styleMask: [.nonactivatingPanel, .borderless], backing: .buffered, defer: false)
         win.isOpaque = false; win.backgroundColor = .clear; win.hasShadow = true
         win.level = .statusBar
         win.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
         // Never becomes key or activates the app (Photoshop-palette style) — .nonactivatingPanel.
-        // Dragging is handled manually by CompactInteractionView (below), not
-        // isMovableByWindowBackground, so a plain click can be told apart from a drag.
+        // The indicator is pinned (2026-07-27), so nothing may move it: isMovableByWindowBackground
+        // stays false, and CompactInteractionView (below) only *detects* a drag to tell it apart
+        // from a click.
         win.isMovableByWindowBackground = false
         win.ignoresMouseEvents = false
 
@@ -1132,6 +1169,7 @@ final class RecordingPanel {
         content.onPressDown = { [weak self] in self?.onCompactPressDown?() }
         content.onDragDetected = { [weak self] in self?.onCompactDragDetected?() }
         content.onPressUp = { [weak self] wasDrag in self?.onCompactPressUp?(wasDrag) }
+        content.onRightClick = { [weak self] in self?.onCompactRightClick?() }
         // Idle: a very thin translucent line — visible enough to say "online", unobtrusive.
         let bar = NSView(frame: NSRect(x: 4, y: (size.height - 3) / 2, width: size.width - 8, height: 3))
         bar.wantsLayer = true
@@ -1144,31 +1182,24 @@ final class RecordingPanel {
         content.addSubview(levelBars)
         win.contentView = content
 
-        NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: win,
-                                                queue: .main) { [weak self] _ in
-            guard let self, !self.compactAutoRepositioning else { return }
-            self.persistCompactPosition()
+        // Re-pin on display reconfiguration (monitor sleep/wake, resolution change, dock/undock).
+        // This replaces the didMoveNotification observer that used to persist a position: those
+        // same system-initiated moves were being recorded as the user's chosen spot, which is why
+        // the indicator drifted (2026-07-27). Twice — once now, once after things settle, because
+        // WindowServer's own relocation can land after this notification is delivered.
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.recenterCompact()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.recenterCompact() }
         }
 
         compactWin = win; compactIdleBar = bar; compactLevelBars = levelBars; compactHoverBacking = hoverBacking
     }
 
-    // Persist position as a FRACTION of whichever screen it's on right now — a manual drag
-    // always means "the screen I'm looking at", same as the screen-follow timer's own read.
-    private func persistCompactPosition() {
-        guard let win = compactWin else { return }
-        let screen = Self.screenAt(NSPoint(x: win.frame.midX, y: win.frame.midY)) ?? compactCurrentScreen ?? NSScreen.main
-        guard let screen else { return }
-        compactCurrentScreen = screen
-        var c = Config.load()
-        c.compactFracX = Double((win.frame.midX - screen.frame.minX) / screen.frame.width)
-        c.compactFracY = Double((win.frame.midY - screen.frame.minY) / screen.frame.height)
-        c.save()
-    }
-
     private func showCompactIdle() {
         DispatchQueue.main.async {
-            guard let win = self.compactWin else { return }
+            guard !self.compactHidden, let win = self.compactWin else { return }
             self.compactLevelBars?.isHidden = true; self.compactLevelBars?.reset()
             self.compactIdleBar?.isHidden = false
             win.orderFrontRegardless()
@@ -1176,6 +1207,7 @@ final class RecordingPanel {
     }
     private func showCompactActive() {
         DispatchQueue.main.async {
+            guard !self.compactHidden else { return }   // dictation still runs, it just draws nothing
             if self.compactWin == nil { self.buildCompact() }
             guard let win = self.compactWin else { return }
             self.compactIdleBar?.isHidden = true
@@ -1615,22 +1647,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // lockFd is intentionally never closed — the lock must live exactly as long as the process.
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         setStatusIcon("mic")
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Tap Right ⌘ to start / stop", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
-        let cleanupItem = NSMenuItem(title: "AI Cleanup (Groq)", action: #selector(toggleLLMCleanup(_:)), keyEquivalent: "")
-        cleanupItem.state = (cfg.llmCleanup ?? false) ? .on : .off
-        menu.addItem(cleanupItem)
-        menu.addItem(NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ","))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Sori \(soriVersion)", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-        menu.items.forEach { $0.target = self }
-        statusItem.menu = menu
+        statusItem.menu = buildMainMenu()
 
         recorder.onLevel = { [weak self] lv in self?.panel.setLevel(lv) }
+        // Hidden must be applied BEFORE style: switching to compact while hidden has to build
+        // nothing at all (feedback 2026-07-27 — the indicator can be turned off entirely).
+        panel.compactHidden = cfg.compactHidden ?? false
         // Compact style shows an always-visible idle indicator from launch ("online and
         // available"); classic stays hidden until a recording starts, so this is a no-op for it.
         panel.style = cfg.panelStyle ?? "classic"
@@ -1650,7 +1672,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         panel.onCompactDragDetected = { [weak self] in
             guard let self, self.clickStartedThisPress else { return }
-            // Turned into a drag-to-reposition, not a click — discard silently, no paste.
+            // The press slid instead of clicking — not a deliberate start. Discard silently, no
+            // paste. (The indicator no longer moves with the drag; this cancel is the whole
+            // remaining reason to detect one.)
             self.clickStartedThisPress = false
             self.cancelRecording()
         }
@@ -1667,6 +1691,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             } else if self.isRecording {
                 self.stopAndTranscribe()                  // click while already recording -> tap-off
             }
+        }
+        // Right-click the indicator = the same menu the menu-bar icon shows (feedback
+        // 2026-07-27). `in: nil` means the point is in SCREEN coordinates, which is what
+        // NSEvent.mouseLocation already gives us — no view-space conversion, and no need for
+        // the .nonactivatingPanel to become key.
+        panel.onCompactRightClick = { [weak self] in
+            guard let self else { return }
+            self.buildMainMenu().popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
         }
 
         AVCaptureDevice.requestAccess(for: .audio) { g in wlog("mic granted=\(g)") }
@@ -1706,11 +1738,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         b.title = ""
     }
 
+    // One menu definition, two hosts: the status item and the compact indicator's right-click
+    // (feedback 2026-07-27). Built fresh per call so the checkmarks read the CURRENT cfg —
+    // with two hosts there is no single long-lived NSMenuItem left to keep in sync.
+    func buildMainMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Tap Right ⌘ to start / stop", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
+        let cleanupItem = NSMenuItem(title: "AI Cleanup (Groq)", action: #selector(toggleLLMCleanup(_:)), keyEquivalent: "")
+        cleanupItem.state = (cfg.llmCleanup ?? false) ? .on : .off
+        menu.addItem(cleanupItem)
+        // Reachable from the menu bar too — otherwise turning the indicator off would hide the
+        // only way to turn it back on.
+        let indicatorItem = NSMenuItem(title: "Floating Indicator", action: #selector(toggleCompactIndicator(_:)), keyEquivalent: "")
+        indicatorItem.state = (cfg.compactHidden ?? false) ? .off : .on
+        menu.addItem(indicatorItem)
+        menu.addItem(NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ","))
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Sori \(soriVersion)", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        // Explicit target on every item: a menu popped up from the .nonactivatingPanel never
+        // becomes key, so nothing may depend on the responder chain to find an action.
+        menu.items.forEach { $0.target = self }
+        return menu
+    }
+
     @objc func toggleLLMCleanup(_ sender: NSMenuItem) {
         cfg.llmCleanup = !(cfg.llmCleanup ?? false)
         sender.state = (cfg.llmCleanup ?? false) ? .on : .off
         cfg.save()
+        // The sender may be a throwaway right-click menu; rebuild the bar's so both agree.
+        statusItem.menu = buildMainMenu()
         wlog("llmCleanup toggled -> \(cfg.llmCleanup ?? false)")
+    }
+
+    @objc func toggleCompactIndicator(_ sender: NSMenuItem) {
+        let hidden = !(cfg.compactHidden ?? false)
+        cfg.compactHidden = hidden
+        sender.state = hidden ? .off : .on
+        cfg.save()
+        panel.compactHidden = hidden
+        statusItem.menu = buildMainMenu()
+        wlog("compact indicator hidden -> \(hidden)")
     }
 
     // Menu-bar apps have no dock icon, so an alert can open behind whatever is frontmost —
@@ -1779,6 +1850,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             settings?.onSave = { [weak self] c in
                 self?.cfg = c
                 self?.panel.style = c.panelStyle ?? "classic"
+                // Settings writes the whole config back, so re-apply the indicator's visibility
+                // and rebuild the menu from it — otherwise the checkmark and the screen disagree.
+                self?.panel.compactHidden = c.compactHidden ?? false
+                self?.statusItem.menu = self?.buildMainMenu()
                 wlog("settings applied")
             }
         } else { settings?.reloadFromDisk() }
