@@ -13,12 +13,22 @@ let soriWorkDir: String = {
                                              attributes: [.posixPermissions: 0o700])
     return d
 }()
+// macOS's temp cleaner purges $TMPDIR entries untouched for ~3 days, so this dir can
+// vanish under a long-running app — recreate on demand, never trust the launch-time create.
+@discardableResult
+func ensureWorkDir() -> Bool {
+    var isDir: ObjCBool = false
+    if FileManager.default.fileExists(atPath: soriWorkDir, isDirectory: &isDir), isDir.boolValue { return true }
+    return (try? FileManager.default.createDirectory(atPath: soriWorkDir, withIntermediateDirectories: true,
+                                                     attributes: [.posixPermissions: 0o700])) != nil
+}
 func workPath(_ name: String) -> String { (soriWorkDir as NSString).appendingPathComponent(name) }
 let logPath = workPath("sori.log")
 let wlogDF: DateFormatter = {
     let d = DateFormatter(); d.dateFormat = "MM-dd HH:mm:ss.SSS"; return d
 }()
 func wlog(_ msg: String) {
+    ensureWorkDir()
     let line = wlogDF.string(from: Date()) + " " + msg + "\n"
     if let data = line.data(using: .utf8) {
         if FileManager.default.fileExists(atPath: logPath),
@@ -407,7 +417,7 @@ enum WhisperServer {
 // MARK: - Version + updates
 // THE single source of truth for the version. install.sh and make-release.sh both grep this
 // line for the bundle plist and the release zip name, so there is exactly one number to bump.
-let soriVersion = "1.0.2"
+let soriVersion = "1.0.3"
 
 // "Check for Updates…" — what it can actually do depends on how Sori was installed, because
 // macOS ties Accessibility/Input Monitoring grants to the code signature:
@@ -553,6 +563,7 @@ class AudioRecorder {
     private var loggedBufferSize = false
 
     func start() {
+        if !ensureWorkDir() { wlog("recorder ABORT — work dir gone and could not be recreated") }
         try? FileManager.default.removeItem(at: outputURL)
         floorDb = .nan; loggedBufferSize = false
         let input = engine.inputNode
