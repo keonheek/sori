@@ -192,6 +192,53 @@ enum TextCleanup {
         }
         return t
     }
+
+    // Hallucination repetition loop: on long recordings the decoder can lock onto one
+    // sentence and emit it over and over, generating from its language prior instead of
+    // the audio (observed live 2026-08-10: "한 번 더 확인해 주실 수 있을 것 같습니다." ×9,
+    // in 습니다체 the speaker never used — register drift is part of the same failure).
+    // Beam search (-bs 5) reduced but did not eliminate this. A sentence repeated 3+
+    // times VERBATIM is never real dictation; keep one copy. Word-level stutter
+    // ("Monday, Monday, Monday") is separate — clean() rule 3 handles it. Runs on every
+    // final transcript regardless of cleanupEnabled: this is a decode-failure guard,
+    // not style cleanup.
+    static func collapseRepetitionLoop(_ input: String) -> String {
+        let terminators: Set<Character> = [".", "!", "?", "…"]
+        // Split into sentence chunks, each keeping its terminator run + trailing space,
+        // so joined() reconstructs the text byte-for-byte when nothing collapses.
+        var chunks: [Substring] = []
+        var start = input.startIndex
+        var i = input.startIndex
+        while i < input.endIndex {
+            if terminators.contains(input[i]) {
+                var j = input.index(after: i)
+                while j < input.endIndex, terminators.contains(input[j]) { j = input.index(after: j) }
+                while j < input.endIndex, input[j].isWhitespace { j = input.index(after: j) }
+                chunks.append(input[start..<j])
+                start = j; i = j
+            } else {
+                i = input.index(after: i)
+            }
+        }
+        if start < input.endIndex { chunks.append(input[start...]) }
+        guard chunks.count >= 3 else { return input }
+
+        func norm(_ s: Substring) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
+        var out: [Substring] = []
+        var idx = 0
+        while idx < chunks.count {
+            var runEnd = idx + 1
+            while runEnd < chunks.count, norm(chunks[runEnd]) == norm(chunks[idx]) { runEnd += 1 }
+            if runEnd - idx >= 3 {
+                wlog("repetition loop collapsed: \(runEnd - idx)x \"\(norm(chunks[idx]).prefix(50))\"")
+                out.append(chunks[idx])
+            } else {
+                out.append(contentsOf: chunks[idx..<runEnd])
+            }
+            idx = runEnd
+        }
+        return out.joined()
+    }
 }
 
 // MARK: - Tier 2 cleanup via Claude API (optional; grammar + redundancy rewrite)
@@ -2367,6 +2414,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // dictation, transcript-internal newlines are always spaces.
             text = text.replacingOccurrences(of: "\n", with: " ")
                        .replacingOccurrences(of: " {2,}", with: " ", options: .regularExpression)
+            text = TextCleanup.collapseRepetitionLoop(text)
             text = cfg.applyReplacements(text)
             // Wispr-Flow-style cleanup (rule-based): strip fillers, fix disfluencies, tidy.
             if cfg.cleanupEnabled ?? true { text = TextCleanup.clean(text) }
