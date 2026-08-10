@@ -995,7 +995,11 @@ final class RecordingPanel {
         let sf = screen?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let win = NSWindow(contentRect: NSRect(x: sf.midX - w/2, y: sf.minY + 90, width: w, height: h),
                            styleMask: [.borderless], backing: .buffered, defer: false)
-        win.isOpaque = false; win.backgroundColor = .clear; win.level = .statusBar
+        // .screenSaver, not .statusBar: a native full-screen window gets its own Space where the
+        // menu-bar band (24/25) is where the auto-hiding menu bar and Dock live, and the panel
+        // could land under them. 1000 is clear of that band and still far below the lock-screen
+        // shield, so it never draws over the lock screen (2026-07-28).
+        win.isOpaque = false; win.backgroundColor = .clear; win.level = .screenSaver
         win.ignoresMouseEvents = true
         // .fullScreenAuxiliary is REQUIRED for the panel to appear over full-screen apps /
         // other Spaces — without it the panel silently stays on the original desktop.
@@ -1021,6 +1025,7 @@ final class RecordingPanel {
         let dots = DotsView(frame: NSRect(x: 16, y: padBottom + wavH + gap, width: w - 32, height: 20))
         c.addSubview(dots)
         win.contentView = c; self.window = win; self.wave = wave; self.label = label; self.dots = dots
+        installSpaceObserver()
     }
 
     // MARK: - Compact style: a small, always-visible indicator pinned to bottom-center.
@@ -1033,13 +1038,21 @@ final class RecordingPanel {
     private var compactIdleBar: NSView?
     private var compactLevelBars: LevelBarsView?
     private var compactHoverBacking: NSView?
+    private var compactChip: NSView?
     private var compactScreenFollowTimer: Timer?
     private var compactCurrentScreen: NSScreen?
+    private var spaceObserver: Any?
     // Apple's point is defined as 1/72 inch (2.54cm) regardless of actual screen PPI —
     // the same convention Preview/Print use for "actual size" — so this is an exact physical
     // conversion, not a guess, and holds at any display's default (non-custom) scaling.
     private static let ptPerCm: CGFloat = 72.0 / 2.54
     private static let compactSize = NSSize(width: 1.5 * ptPerCm, height: 0.7 * ptPerCm)  // ~42.5 x 19.8pt
+    // Neutral/idle draws SMALLER than active — "when it's neutral, it should be smaller"
+    // (2026-07-29). Only the visible pill shrinks; the WINDOW stays at compactSize, so the click
+    // target is unchanged from before and LevelBarsView — which lays its 5 bars out once, from its
+    // own bounds, in viewDidMoveToWindow — never sees a resize it can't respond to.
+    private static let compactIdlePill = NSSize(width: compactSize.width * 0.66,
+                                                height: compactSize.height * 0.58)  // ~28 x 11.5pt
     // Bottom-center, clear of the Dock — NOT screen-middle (feedback, 2026-07-09: "the
     // default position should be at the bottom mid, not directly the middle... slightly above the
     // Dock"). Same pragmatic fixed-offset approach the classic panel already uses (sf.minY + 90),
@@ -1130,7 +1143,8 @@ final class RecordingPanel {
         let win = NSPanel(contentRect: NSRect(origin: origin, size: size),
                            styleMask: [.nonactivatingPanel, .borderless], backing: .buffered, defer: false)
         win.isOpaque = false; win.backgroundColor = .clear; win.hasShadow = true
-        win.level = .statusBar
+        // See the classic panel for why .screenSaver rather than .statusBar (2026-07-28).
+        win.level = .screenSaver
         win.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
         // Never becomes key or activates the app (Photoshop-palette style) — .nonactivatingPanel.
         // The indicator is pinned (2026-07-27), so nothing may move it: isMovableByWindowBackground
@@ -1147,7 +1161,9 @@ final class RecordingPanel {
         // whatever happens to be underneath it.
         let chip = NSView(frame: NSRect(origin: .zero, size: size))
         chip.wantsLayer = true
-        chip.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.62).cgColor
+        // 0.62 -> 0.45: he wanted the whole thing more see-through (2026-07-29). Still opaque
+        // enough to keep the white bar legible on a light desktop, which is the chip's only job.
+        chip.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.45).cgColor
         chip.layer?.cornerRadius = size.height / 2
         content.addSubview(chip)
         // Hover: a faint pill fades in so it reads as "this is interactive/draggable."
@@ -1173,7 +1189,7 @@ final class RecordingPanel {
         // Idle: a very thin translucent line — visible enough to say "online", unobtrusive.
         let bar = NSView(frame: NSRect(x: 4, y: (size.height - 3) / 2, width: size.width - 8, height: 3))
         bar.wantsLayer = true
-        bar.layer?.backgroundColor = NSColor(calibratedWhite: 1, alpha: 0.6).cgColor
+        bar.layer?.backgroundColor = NSColor(calibratedWhite: 1, alpha: 0.5).cgColor
         bar.layer?.cornerRadius = 1.5
         content.addSubview(bar)
         // Active: a monochrome equalizer that springs with live mic level — "recognizing audio".
@@ -1195,6 +1211,69 @@ final class RecordingPanel {
         }
 
         compactWin = win; compactIdleBar = bar; compactLevelBars = levelBars; compactHoverBacking = hoverBacking
+        compactChip = chip
+        layoutCompactPill(Self.compactIdlePill, animated: false)   // it comes up neutral
+        installSpaceObserver()
+    }
+
+    // Resize the visible pill (chip + hover backing + idle line) inside the fixed-size window,
+    // centred. Active = fills the window; neutral = compactIdlePill.
+    private func layoutCompactPill(_ pill: NSSize, animated: Bool) {
+        guard let content = compactWin?.contentView else { return }
+        let full = content.bounds
+        let r = NSRect(x: full.midX - pill.width / 2, y: full.midY - pill.height / 2,
+                       width: pill.width, height: pill.height)
+        // The idle line keeps its 3pt thickness at both sizes — it is the "online" tell, and
+        // scaling it down with the pill made it disappear.
+        let barW = max(8, pill.width - 8)
+        let barR = NSRect(x: full.midX - barW / 2, y: full.midY - 1.5, width: barW, height: 3)
+        // cornerRadius is not animatable through the view animator; set it up front. Mid-transition
+        // the pill is fully rounded either way, so there is nothing visible to lose.
+        compactChip?.layer?.cornerRadius = pill.height / 2
+        compactHoverBacking?.layer?.cornerRadius = pill.height / 2
+        let apply = { (chip: NSView?, hover: NSView?, bar: NSView?) in
+            chip?.frame = r; hover?.frame = r; bar?.frame = barR
+        }
+        if animated {
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.18
+                apply(compactChip?.animator(), compactHoverBacking?.animator(), compactIdleBar?.animator())
+            }, completionHandler: { [weak self] in self?.compactWin?.invalidateShadow() })
+        } else {
+            apply(compactChip, compactHoverBacking, compactIdleBar)
+            compactWin?.invalidateShadow()
+        }
+    }
+
+    // Entering native full screen (⌃⌘F) creates a NEW Space. .canJoinAllSpaces alone was not
+    // enough: the persistent compact panel is only ordered front on build/show/unhide, so a Space
+    // that comes into existence afterwards never gets it and the indicator silently vanishes
+    // (his report, 2026-07-28). Re-assert on every Space switch — cheap, and it also covers
+    // ordinary desktop swipes.
+    private func installSpaceObserver() {
+        guard spaceObserver == nil else { return }
+        spaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.reassertOnCurrentSpace()
+            // The fullscreen transition animation is still running when the notification lands;
+            // WindowServer can drop the panel again mid-animation, so re-assert once it settles.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.reassertOnCurrentSpace() }
+        }
+    }
+
+    private func reassertOnCurrentSpace() {
+        if style == "compact", !compactHidden, let win = compactWin {
+            recenterCompact()
+            win.orderFrontRegardless()
+        }
+        // The classic panel only exists while dictating; re-assert it too so a dictation started
+        // before the Space change does not lose its panel.
+        if style != "compact", let win = window, win.isVisible {
+            repositionToActiveScreen(win)
+            win.orderFrontRegardless()
+        }
     }
 
     private func showCompactIdle() {
@@ -1202,6 +1281,7 @@ final class RecordingPanel {
             guard !self.compactHidden, let win = self.compactWin else { return }
             self.compactLevelBars?.isHidden = true; self.compactLevelBars?.reset()
             self.compactIdleBar?.isHidden = false
+            self.layoutCompactPill(Self.compactIdlePill, animated: true)
             win.orderFrontRegardless()
         }
     }
@@ -1212,6 +1292,7 @@ final class RecordingPanel {
             guard let win = self.compactWin else { return }
             self.compactIdleBar?.isHidden = true
             self.compactLevelBars?.isHidden = false; self.compactLevelBars?.reset()
+            self.layoutCompactPill(Self.compactSize, animated: true)   // grows on dictation
             win.orderFrontRegardless()
         }
     }
@@ -2214,18 +2295,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             }
             let raw = text
-
-            // No-speech detection: whisper hallucinates stock phrases on silence.
-            // Normalize (lowercase, strip trailing/leading punctuation+space) before matching,
-            // so "Thank you", "Thank you.", "Thank you!" all collapse to one key.
-            let norm = text.lowercased()
-                .trimmingCharacters(in: CharacterSet(charactersIn: " .,!?-—\n\t\""))
             let silenceArtifacts: Set<String> = [
                 "[blank_audio]", "(silence)", "[silence]", "[ silence ]", "[music]", "(music)",
                 "thank you", "thank you so much", "thanks for watching", "thanks for watching!",
                 "please subscribe", "you", "bye", "bye-bye", "okay", "ok", "so", "uh", "um", "mm",
                 "subtitles by", "transcription by", "amara.org", "♪",
             ]
+
+            // Trailing hallucination: whisper sometimes rides the silence AFTER you stop
+            // talking and appends one of the stock artifacts above as its own segment, tacked
+            // onto otherwise-real speech ("...let's grab lunch.\nThank you."). Strip only an
+            // ISOLATED trailing segment that exactly matches — a genuine "thank you" you
+            // actually say (e.g. an email sign-off) is always part of a longer segment with
+            // other words, so it never normalizes down to a bare match on its own line.
+            let rawSegments = text.components(separatedBy: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            if rawSegments.count >= 2 {
+                let lastNorm = rawSegments.last!.lowercased()
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " .,!?-—\n\t\""))
+                if silenceArtifacts.contains(lastNorm) {
+                    wlog("trailing hallucination segment dropped (\"\(rawSegments.last!)\")")
+                    text = rawSegments.dropLast().joined(separator: "\n")
+                }
+            }
+
+            // No-speech detection: whisper hallucinates stock phrases on silence.
+            // Normalize (lowercase, strip trailing/leading punctuation+space) before matching,
+            // so "Thank you", "Thank you.", "Thank you!" all collapse to one key.
+            let norm = text.lowercased()
+                .trimmingCharacters(in: CharacterSet(charactersIn: " .,!?-—\n\t\""))
             // Prompt echo: on silence/very short audio whisper sometimes continues the
             // PROMPT instead of transcribing — empirically it pastes the style anchor's
             // tail ("Let's begin.") on ~half of accidental blank recordings. Suppress
