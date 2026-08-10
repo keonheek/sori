@@ -464,7 +464,7 @@ enum WhisperServer {
 // MARK: - Version + updates
 // THE single source of truth for the version. install.sh and make-release.sh both grep this
 // line for the bundle plist and the release zip name, so there is exactly one number to bump.
-let soriVersion = "1.0.3"
+let soriVersion = "1.0.4"
 
 // "Check for Updates…" — what it can actually do depends on how Sori was installed, because
 // macOS ties Accessibility/Input Monitoring grants to the code signature:
@@ -597,7 +597,13 @@ enum Updater {
 
 // MARK: - Recorder (16k mono PCM, live level metering)
 class AudioRecorder {
-    private let engine = AVAudioEngine()
+    // A FRESH engine per recording — never a long-lived one. 2026-08-10: unplugging the
+    // earphone mid-recording made CoreAudio stop the engine behind the app's back; stop()
+    // gated removeTap on engine.isRunning, so the tap leaked on the shared engine and every
+    // later installTap raised "CreateRecordingTap: (nullptr == Tap())" — an ObjC exception
+    // AppKit's run-loop catcher swallows, so dictation went silently dead until relaunch.
+    private var engine: AVAudioEngine?
+    private var configObserver: NSObjectProtocol?
     private var audioFile: AVAudioFile?
     private var converter: AVAudioConverter?
     private let outputURL = URL(fileURLWithPath: workPath("sori.wav"))
@@ -613,16 +619,31 @@ class AudioRecorder {
         if !ensureWorkDir() { wlog("recorder ABORT — work dir gone and could not be recreated") }
         try? FileManager.default.removeItem(at: outputURL)
         floorDb = .nan; loggedBufferSize = false
-        let input = engine.inputNode
-        let inFormat = input.inputFormat(forBus: 0)
+        teardownEngine()
+        let engine = AVAudioEngine()
+        self.engine = engine
+        let inFormat = engine.inputNode.inputFormat(forBus: 0)
         wlog("recorder.start sr=\(inFormat.sampleRate) ch=\(inFormat.channelCount)")
-        guard inFormat.sampleRate > 0 else { wlog("recorder ABORT — bad format (mic denied?)"); return }
-        converter = AVAudioConverter(from: inFormat, to: targetFormat)
+        guard inFormat.sampleRate > 0 else {
+            wlog("recorder ABORT — bad format (mic denied?)"); self.engine = nil; return
+        }
         do {
             audioFile = try AVAudioFile(forWriting: outputURL, settings: targetFormat.settings,
                                         commonFormat: .pcmFormatInt16, interleaved: true)
-        } catch { wlog("AVAudioFile FAILED: \(error)"); return }
+        } catch { wlog("AVAudioFile FAILED: \(error)"); self.engine = nil; return }
+        installRecordingTap(on: engine)
+        observeConfigChange(engine)
+        do { try engine.start(); wlog("engine started") } catch { wlog("engine.start FAILED: \(error)") }
+    }
 
+    // Tap + converter for the engine's CURRENT input format. The removeTap first is
+    // load-bearing: installing over an existing tap raises the swallowed ObjC exception
+    // described above, which reads as "mic dead" with zero evidence in this log.
+    private func installRecordingTap(on engine: AVAudioEngine) {
+        let input = engine.inputNode
+        input.removeTap(onBus: 0)
+        let inFormat = input.inputFormat(forBus: 0)
+        converter = AVAudioConverter(from: inFormat, to: targetFormat)
         input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { [weak self] buf, _ in
             guard let self else { return }
             if !self.loggedBufferSize { self.loggedBufferSize = true; wlog("tap buffer frames=\(buf.frameLength)") }
@@ -643,7 +664,44 @@ class AudioRecorder {
             }
             if outBuf.frameLength > 0 { try? file.write(from: outBuf) }
         }
-        do { try engine.start(); wlog("engine started") } catch { wlog("engine.start FAILED: \(error)") }
+    }
+
+    // A route change (headphone unplug, device swap, sample-rate change) stops the engine
+    // behind the app's back mid-recording. Rebuild capture on the new default device so the
+    // rest of the dictation still lands in the same WAV instead of going silently missing.
+    private func observeConfigChange(_ engine: AVAudioEngine) {
+        if let o = configObserver { NotificationCenter.default.removeObserver(o) }
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil) { [weak self] _ in
+            DispatchQueue.main.async { self?.rebuildAfterConfigChange() }
+        }
+    }
+
+    private func rebuildAfterConfigChange() {
+        guard let old = engine, audioFile != nil else { return }   // not recording anymore
+        old.inputNode.removeTap(onBus: 0)
+        if old.isRunning { old.stop() }
+        // Reusing a stopped engine after a device swap is unreliable — start clean.
+        let fresh = AVAudioEngine()
+        engine = fresh
+        let sr = fresh.inputNode.inputFormat(forBus: 0).sampleRate
+        guard sr > 0 else { wlog("route change: no usable input — recording stalled"); return }
+        installRecordingTap(on: fresh)
+        observeConfigChange(fresh)
+        do { try fresh.start(); wlog("route change: capture rebuilt (sr=\(sr))") }
+        catch { wlog("route change: engine restart FAILED: \(error)") }
+    }
+
+    // UNCONDITIONAL removeTap — gating it on engine.isRunning is exactly what leaked the
+    // tap on 2026-08-10 (a route change had already stopped the engine). removeTap with no
+    // tap installed is a safe no-op (harness-verified).
+    private func teardownEngine() {
+        if let o = configObserver { NotificationCenter.default.removeObserver(o); configObserver = nil }
+        if let e = engine {
+            e.inputNode.removeTap(onBus: 0)
+            if e.isRunning { e.stop() }
+            engine = nil
+        }
     }
 
     // Map a raw buffer RMS to the 0...1 the meters draw. Amplitude-domain scaling (the old
@@ -672,14 +730,14 @@ class AudioRecorder {
     }
 
     func stop(completion: @escaping (URL) -> Void) {
-        if engine.isRunning { engine.inputNode.removeTap(onBus: 0); engine.stop() }
+        teardownEngine()
         audioFile = nil
         wlog("recorder.stop exists=\(FileManager.default.fileExists(atPath: outputURL.path))")
         completion(outputURL)
     }
     // Cancel without transcribing — stop engine and discard the WAV.
     func cancel() {
-        if engine.isRunning { engine.inputNode.removeTap(onBus: 0); engine.stop() }
+        teardownEngine()
         audioFile = nil
         try? FileManager.default.removeItem(at: outputURL)
         wlog("recorder.cancel — audio discarded")
