@@ -2156,7 +2156,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         recorder.start()
         // Live preview is OFF by default — it runs a second whisper process during recording,
         // which competes for compute. Only start it when explicitly enabled, and use a FAST model.
-        if cfg.livePreview ?? false { startPartialTimer() }
+        // Gate on the SAME condition setPartial renders under: the compact panel has no room for
+        // live text and drops every partial on the floor (see RecordingPanel.setPartial). With
+        // panelStyle=compact this loop was spawning ~23 whisper-cli passes per dictation — each
+        // re-transcribing the whole recording from t=0, so cost grew quadratically with length —
+        // purely to produce text nothing displayed. 1289 discarded passes over one 9-hour session,
+        // and because they are children of Sori.app they roll up into the battery menu's "Apps
+        // Using Significant Energy" entry for Sori (diagnosed 2026-08-10).
+        if (cfg.livePreview ?? false) && panel.style != "compact" { startPartialTimer() }
     }
 
     func cancelRecording() {
