@@ -21,7 +21,27 @@ if ! command -v whisper-cli >/dev/null; then
     brew install whisper-cpp
 fi
 
-# 2. Models (base for language detection + live preview, large-v3-turbo for transcription)
+# 1b. Qwen3-ASR engine venv. This is the transcription engine as of 2026-08-12;
+# whisper-cpp above is now only used for the live-preview partials.
+VENV="$HOME/.sori-venv"
+if [ ! -x "$VENV/bin/python3" ]; then
+    echo "-- Creating ASR engine venv at $VENV ..."
+    python3 -m venv "$VENV"
+fi
+echo "-- Installing mlx-audio (Qwen3-ASR engine)..."
+"$VENV/bin/pip" install -q --upgrade pip
+"$VENV/bin/pip" install -q mlx-audio
+"$VENV/bin/python3" -c "import mlx_audio" || { echo "ERROR: mlx-audio install failed"; exit 1; }
+# Pre-pull the weights so the first dictation isn't a 1.9GB download.
+echo "-- Fetching Qwen3-ASR weights (~1.9GB, first run only)..."
+"$VENV/bin/python3" - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download("mlx-community/Qwen3-ASR-1.7B-8bit")
+print("weights ready")
+PY
+
+# 2. Models (ggml-base is used ONLY for the live-preview partials now -- the final
+# transcript comes from Qwen3-ASR. large-v3-turbo is no longer downloaded.)
 mkdir -p "$MODELS"
 dl() {
     local f="$1"
@@ -34,7 +54,6 @@ dl() {
     mv "$MODELS/$f.tmp" "$MODELS/$f"
 }
 dl ggml-base.bin
-dl ggml-large-v3-turbo.bin
 
 # 3. Build
 echo "-- Building..."
@@ -110,6 +129,7 @@ PLIST_EOF
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 pkill -f "$APP/Contents/MacOS/Sori" 2>/dev/null || true
 pkill -f "whisper-server.*--port 8917" 2>/dev/null || true
+pkill -f "qwen_server.py.*--port 8918" 2>/dev/null || true
 sleep 1
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 # bootstrap REGISTERS the job; RunAtLoad does not reliably start it right after a bootout

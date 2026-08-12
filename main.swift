@@ -43,13 +43,22 @@ func wlog(_ msg: String) {
 // MARK: - Config (JSON at ~/.sori.conf — editable in Settings, no rebuild needed)
 struct Replacement: Codable { var from: String; var to: String }
 struct Config: Codable {
-    var model: String = "ggml-large-v3-turbo.bin"
+    // Hugging Face repo id for the Qwen3-ASR engine. Replaced the ggml `model`
+    // field 2026-08-12; the old key is kept below so an existing ~/.sori.conf
+    // still decodes, but nothing reads it any more.
+    var asrModel: String? = nil          // default: mlx-community/Qwen3-ASR-1.7B-8bit
+    var model: String = "ggml-large-v3-turbo.bin"   // DEAD: pre-Qwen ggml filename
     var lang: String = "en"
     var sound: Bool = true
     var promptHint: String = ""
     var replacements: [Replacement] = []
-    var aiTerms: String? = nil           // curated AI/dev vocabulary for whisper bias
+    var aiTerms: String? = nil           // curated AI/dev vocabulary
     var aiTermsEnabled: Bool? = nil      // toggle the AI vocabulary on/off
+    // Feed aiTerms to the ASR engine as a bias prompt. Default OFF: measured
+    // 2026-08-12 it fixed "Grok"->"Groq" but hallucinated "Qwen 3.6" into
+    // "Claude 3.6" (first glossary entry) and duplicated "Pinecone Pinecone".
+    // Net term score was unchanged, so the bias is not worth a confident wrong brand.
+    var asrBias: Bool? = nil
     var pressEnter: Bool? = nil          // auto-press Enter after pasting (Spokenly-style submit)
     var cleanupEnabled: Bool? = nil      // Wispr-Flow-style: strip fillers, fix disfluencies (rule-based)
     var llmCleanup: Bool? = nil          // Tier 2: send to a local/remote LLM for grammar+redundancy rewrite
@@ -73,10 +82,36 @@ struct Config: Codable {
     // the anchor leaking into transcripts of silence (whisper echoes prompt text).
     static let styleAnchor = "Okay, so here's the plan: first we test it, then we ship it. Sounds good, right? Great — let's begin."
 
-    // Combined whisper --prompt. ORDER MATTERS: whisper keeps only the LAST 223 prompt
-    // tokens and silently drops the head. So: glossary first (first to be sacrificed),
-    // Names just before the end (must survive — it's the whole point of the hint), style
-    // anchor last (tokens nearest the audio pull style hardest).
+    // Bias prompt for Qwen3-ASR (`system_prompt`). Replaced the whisper --prompt builder
+    // 2026-08-12.
+    //
+    // THE CAP IS THE WHOLE POINT — measured on the 8-line bilingual clip, scoring 13 terms:
+    //   no bias          11/13, 0 duplications, no hallucination  (missed Groq AND Qwen)
+    //   9-term list      12/13, 1 duplication,  no hallucination  (fixed Groq AND Qwen)
+    //   full 44-term     11/13, 1 duplication,  hallucinated "Claude 3.6" for "Qwen 3.6"
+    // A long list makes the model reach for whatever brand sits nearest the top (Claude was
+    // first in the glossary). Names go FIRST because they are the ones no model can guess;
+    // the AI glossary fills whatever budget is left.
+    static let maxBiasTerms = 12
+
+    var biasPrompt: String {
+        var terms: [String] = []
+        let hint = promptHint.trimmingCharacters(in: .whitespaces)
+        if !hint.isEmpty {
+            terms += hint.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+        if (aiTermsEnabled ?? true), let t = aiTerms?.trimmingCharacters(in: .whitespaces), !t.isEmpty {
+            terms += t.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+        terms = terms.filter { !$0.isEmpty }
+        guard !terms.isEmpty else { return "" }
+        let capped = Array(terms.prefix(Config.maxBiasTerms))
+        return "Vocabulary that may appear in the audio, spell these exactly: "
+             + capped.joined(separator: ", ")
+    }
+
+    // Kept only so the old whisper prompt builder below still compiles for reference during
+    // the transition; nothing calls it. Remove once the Qwen lane has a few weeks on it.
     var combinedPrompt: String {
         let anchor = Config.styleAnchor
         let hint = promptHint.trimmingCharacters(in: .whitespaces)
@@ -359,12 +394,35 @@ enum LLMCleanup {
     }
 }
 
-// Resident whisper-server: keeps the turbo model in RAM so the final transcription
-// skips the ~0.9s per-press model load (measured: CLI 1.1-1.3s vs warm server
-// 0.3-0.5s on an 8-9s clip). Every call FALLS BACK to whisper-cli when the server
-// is down/loading, so dictation never breaks because of this layer.
-enum WhisperServer {
-    static let port = 8917
+// Resident Qwen3-ASR engine (engine/qwen_server.py). Replaced whisper.cpp as the
+// transcription path 2026-08-12 after an A/B on an 8-line Korean/English clip:
+//
+//   qwen3-asr-1.7b            11-12 / 13 technical terms, no repetition loop
+//   whisper large-v3-turbo     8 / 13 WITH Sori's own aiTerms glossary, loop 3x
+//   apple SpeechAnalyzer       1 / 13, silently DROPPED a whole English sentence
+//
+// whisper's glossary already contained Pinecone/Groq/Whisper/Qwen and still missed
+// them, so the gap is the model, not the prompt. Qwen also does its own language
+// identification, which is why the ggml-base pre-detection pass is gone.
+//
+// The model load (~1.4s) is paid once at launch, not per keypress: invoking the
+// mlx CLI per dictation costs ~9s, nearly all of it Python interpreter startup.
+enum QwenServer {
+    static let port = 8918
+    static let defaultRepo = "mlx-community/Qwen3-ASR-1.7B-8bit"
+    // Absolute path to the venv python that has mlx-audio installed; install.sh
+    // creates it. Kept separate from any system python so a `brew upgrade` of
+    // python3 cannot silently break dictation.
+    static var pythonPath: String {
+        (NSHomeDirectory() as NSString).appendingPathComponent(".sori-venv/bin/python3")
+    }
+    static var serverScript: String {
+        // Bundled next to the executable in Sori.app; falls back to the source
+        // checkout so `swiftc main.swift && ./main` works during development.
+        let bundled = Bundle.main.bundlePath + "/Contents/Resources/qwen_server.py"
+        if FileManager.default.fileExists(atPath: bundled) { return bundled }
+        return (NSHomeDirectory() as NSString).appendingPathComponent("Dev/sori/engine/qwen_server.py")
+    }
     private static var proc: Process?
     private static var runningModel: String?   // model the CURRENT server was spawned with
     private static let lock = NSLock()
@@ -386,77 +444,87 @@ enum WhisperServer {
         lock.lock(); defer { lock.unlock() }
         if healthy() {
             // A healthy server is only trustworthy if WE spawned it with THIS model.
-            // Otherwise it's an orphan from before a SIGKILL redeploy (deploy.sh pkill
-            // doesn't match the child) or a server on the old model after a Settings
-            // switch — either way it would silently transcribe with the WRONG model.
+            // Otherwise it's an orphan from an earlier SIGKILL redeploy, or a server
+            // on the old repo after a Settings switch — either way it would silently
+            // transcribe with the WRONG model.
             if runningModel == modelPath { return }
-            wlog("whisper-server on :\(port) is stale/orphaned (model \(runningModel ?? "unknown")) — replacing")
+            wlog("qwen_server on :\(port) is stale/orphaned (model \(runningModel ?? "unknown")) — replacing")
             if let p = proc, p.isRunning { p.terminate() }
             let kill = Process()
             kill.launchPath = "/usr/bin/pkill"
-            kill.arguments = ["-f", "whisper-server.*--port \(port)"]
+            kill.arguments = ["-f", "qwen_server.py.*--port \(port)"]
             try? kill.run(); kill.waitUntilExit()
             proc = nil; runningModel = nil
             usleep(300_000)   // let the port free up before respawn
         }
-        // A spawn may still be loading the model (health fails during load) — don't stack a second.
+        // A spawn may still be loading the model (health returns 503 during load) —
+        // don't stack a second one on top.
         if let p = proc, p.isRunning { return }
-        guard FileManager.default.fileExists(atPath: whisperTool("whisper-server")),
-              FileManager.default.fileExists(atPath: modelPath) else { return }
+        guard FileManager.default.fileExists(atPath: pythonPath) else {
+            wlog("qwen engine MISSING: no venv python at \(pythonPath) — run install.sh")
+            return
+        }
+        guard FileManager.default.fileExists(atPath: serverScript) else {
+            wlog("qwen engine MISSING: no qwen_server.py at \(serverScript)")
+            return
+        }
         let t = Process()
-        t.launchPath = whisperTool("whisper-server")
-        // -bs/-bo: whisper-server DEFAULTS to greedy decoding (beam -1, best-of 2) while
-        // whisper-cli defaults to beam search 5/5. Greedy caused a live repetition-loop
-        // mistranscription ("발표는 목요일에" -> "Bullet is not Monday, Monday, Monday...",
-        // 2026-07-22). Match the CLI's decode quality explicitly.
-        t.arguments = ["-m", modelPath, "--port", String(port), "--host", "127.0.0.1",
-                       "-bs", "5", "-bo", "5"]
+        t.launchPath = pythonPath
+        t.arguments = [serverScript, "--port", String(port), "--model", modelPath]
         t.standardOutput = FileHandle.nullDevice
-        t.standardError = FileHandle.nullDevice
-        do { try t.run(); proc = t; runningModel = modelPath; wlog("whisper-server spawned (pid \(t.processIdentifier))") }
-        catch { wlog("whisper-server spawn FAILED: \(error)") }
+        // Keep stderr: the server logs model-load failures there, and a silent
+        // engine is the one failure mode that looks identical to a dead hotkey.
+        let errPipe = Pipe()
+        t.standardError = errPipe
+        errPipe.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            guard !d.isEmpty, let s = String(data: d, encoding: .utf8) else { return }
+            for line in s.split(separator: "\n") where !line.isEmpty { wlog("[qwen] \(line)") }
+        }
+        do { try t.run(); proc = t; runningModel = modelPath; wlog("qwen_server spawned (pid \(t.processIdentifier))") }
+        catch { wlog("qwen_server spawn FAILED: \(error)") }
     }
 
     static func stop() {
         lock.lock(); defer { lock.unlock() }
-        if let p = proc, p.isRunning { p.terminate(); wlog("whisper-server stopped") }
+        if let p = proc, p.isRunning { p.terminate(); wlog("qwen_server stopped") }
         proc = nil; runningModel = nil
     }
 
-    // POST the wav to /inference. Returns nil on ANY failure -> caller falls back to CLI.
-    static func transcribe(wav: String, lang: String, prompt: String) -> String? {
+    // POST the wav path to /inference. The server is loopback-local, so the audio
+    // is passed by path rather than uploaded.
+    //
+    // `lang` may be empty: Qwen3-ASR identifies the language itself across 52
+    // languages, which is what let the ggml-base pre-detection pass be deleted.
+    // `vocabulary` is the aiTerms glossary and is normally EMPTY — see the note in
+    // qwen_server.py: biasing fixed "Groq" but hallucinated "Qwen 3.6" into
+    // "Claude 3.6", which is a worse error because it survives proofreading.
+    static func transcribe(wav: String, lang: String, vocabulary: String = "") -> String? {
         guard healthy() else { return nil }
-        guard let audio = FileManager.default.contents(atPath: wav),
-              let url = URL(string: "http://127.0.0.1:\(port)/inference") else { return nil }
-        let boundary = "wptt-\(UUID().uuidString)"
-        var body = Data()
-        func field(_ name: String, _ value: String) {
-            body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
-        }
-        field("response_format", "json")
-        field("language", lang)
-        if !prompt.isEmpty { field("prompt", prompt) }
-        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
-        body.append(audio)
-        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+        guard let url = URL(string: "http://127.0.0.1:\(port)/inference") else { return nil }
+        var payload: [String: String] = ["path": wav]
+        if !lang.isEmpty && lang != "auto" { payload["language"] = lang }
+        if !vocabulary.isEmpty { payload["context"] = vocabulary }
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
 
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
-        req.timeoutInterval = 30   // generous: long recordings; CLI fallback only on real failure
+        req.timeoutInterval = 60   // generous: long recordings
 
         let sem = DispatchSemaphore(value: 0)
         var out: String? = nil
         URLSession.shared.dataTask(with: req) { data, _, err in
             defer { sem.signal() }
-            if let err = err { wlog("whisper-server inference error: \(err)"); return }
+            if let err = err { wlog("qwen_server inference error: \(err)"); return }
             guard let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let t = json["text"] as? String else { return }
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            if let e = json["error"] as? String { wlog("qwen_server inference failed: \(e)"); return }
+            guard let t = json["text"] as? String else { return }
             out = t.trimmingCharacters(in: .whitespacesAndNewlines)
         }.resume()
-        _ = sem.wait(timeout: .now() + 31)
+        _ = sem.wait(timeout: .now() + 61)
         return out
     }
 }
@@ -1556,13 +1624,19 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
         let H = p.bounds.height
         sectionHeader("General", p, H - 56)
 
+        // Lists Qwen3-ASR MLX quants, not ggml files. Before 2026-08-12 this listed
+        // ~/.sori-models/*.bin and wrote cfg.model — which nothing had read since the
+        // engine swap, so the pane confidently displayed a model that was not running.
         fieldLabel("Model", p, H - 100)
         modelPopup = NSPopUpButton(frame: NSRect(x: 28, y: H - 128, width: 300, height: 26))
-        let models = (try? FileManager.default.contentsOfDirectory(atPath:
-            (NSHomeDirectory() as NSString).appendingPathComponent(".sori-models")))?
-            .filter { $0.hasSuffix(".bin") }.sorted() ?? [cfg.model]
-        modelPopup.addItems(withTitles: models)
-        modelPopup.selectItem(withTitle: cfg.model)
+        let repos = [
+            "mlx-community/Qwen3-ASR-1.7B-8bit",   // default: best accuracy/size on this Mac
+            "mlx-community/Qwen3-ASR-1.7B-4bit",   // smaller/faster, untested here
+            "mlx-community/Qwen3-ASR-0.6B-8bit",   // fallback for low memory, untested here
+        ]
+        let current = cfg.asrModel ?? QwenServer.defaultRepo
+        modelPopup.addItems(withTitles: repos.contains(current) ? repos : repos + [current])
+        modelPopup.selectItem(withTitle: current)
         p.addSubview(modelPopup)
 
         fieldLabel("Language", p, H - 168)
@@ -1706,7 +1780,7 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
         // sitting in the field editor is lost — clicking Save (or pressing Enter, which
         // hits this button's \r key-equivalent BEFORE the cell commits) saved stale rows.
         window?.makeFirstResponder(nil)
-        cfg.model = modelPopup.titleOfSelectedItem ?? cfg.model
+        cfg.asrModel = modelPopup.titleOfSelectedItem ?? cfg.asrModel
         cfg.lang = langPopup.titleOfSelectedItem ?? cfg.lang
         cfg.promptHint = hintField.stringValue
         cfg.sound = soundCheck.state == .on
@@ -1721,7 +1795,7 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
         // user saw and edited is now canonical in `replacements`.
         cfg.learnedReplacements = []
         cfg.save()
-        wlog("settings saved: \(cfg.replacements.count) corrections, model=\(cfg.model), pressEnter=\(cfg.pressEnter ?? false), panelStyle=\(cfg.panelStyle ?? "classic")")
+        wlog("settings saved: \(cfg.replacements.count) corrections, model=\(cfg.asrModel ?? QwenServer.defaultRepo), pressEnter=\(cfg.pressEnter ?? false), panelStyle=\(cfg.panelStyle ?? "classic")")
         LoginItem.set(enabled: loginCheck.state == .on)
         onSave?(cfg)
         window?.close()
@@ -1915,13 +1989,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Preload the warm engine so even the FIRST dictation skips the model load.
         // Off the main thread — server spawn + model load takes ~2s.
         if cfg.warmEngine ?? true {
-            let modelPath = (NSHomeDirectory() as NSString).appendingPathComponent(".sori-models/\(cfg.model)")
-            DispatchQueue.global(qos: .utility).async { WhisperServer.ensureRunning(modelPath: modelPath) }
+            let repo = cfg.asrModel ?? QwenServer.defaultRepo
+            DispatchQueue.global(qos: .utility).async { QwenServer.ensureRunning(modelPath: repo) }
         }
     }
 
     func applicationWillTerminate(_ n: Notification) {
-        WhisperServer.stop()
+        QwenServer.stop()
     }
 
     // Native template SF Symbol in the menu bar (adapts to light/dark, tinted states)
@@ -2351,30 +2425,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wlog("pressed Enter (\(reason))")
     }
 
-    // Prompt-free language pre-detection with the fast base model (~0.17s, p>0.98 in tests).
-    // Needed because in-decode auto-detection is biased by the ENGLISH style-anchor prompt:
-    // observed live 2026-07-22 — real Korean dictation detected as English and TRANSLATED
-    // ("발표는 목요일에..." -> "The announcement is Monday..."). Detection must see the audio
-    // with no prompt in play.
-    private func detectLanguage(_ wav: String) -> String? {
-        let base = (NSHomeDirectory() as NSString).appendingPathComponent(".sori-models/ggml-base.bin")
-        guard FileManager.default.fileExists(atPath: base) else { return nil }
-        let t = Process()
-        t.launchPath = whisperTool("whisper-cli")
-        t.arguments = ["-m", base, "-l", "auto", "-dl", wav]
-        let err = Pipe(); t.standardError = err; t.standardOutput = Pipe()
-        do { try t.run() } catch { return nil }
-        t.waitUntilExit()
-        let out = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        guard let r = out.range(of: "auto-detected language: ") else { return nil }
-        let lang = String(out[r.upperBound...].prefix(2))
-        return lang.allSatisfy { $0.isLetter } ? lang : nil
-    }
+    // detectLanguage() removed 2026-08-12. It ran a second ggml-base pass because
+    // whisper's in-decode auto-detection was biased by the English style-anchor
+    // prompt (Korean detected as English and TRANSLATED, 2026-07-22). Qwen3-ASR
+    // takes no style prompt and does its own language ID over 52 languages, so
+    // the pre-pass, the ggml-base model, and that failure mode are all gone.
 
     private func transcribe(url: URL, cfg: Config, submit: Bool) {
-            let model = (NSHomeDirectory() as NSString).appendingPathComponent(".sori-models/\(cfg.model)")
-            // Clear the previous output FIRST: whisper-cli exits 0 without touching -of
-            // when the input is missing/empty, and a stale out.txt would paste the
+            let repo = cfg.asrModel ?? QwenServer.defaultRepo
+            // Clear the previous output FIRST: a stale out.txt would paste the
             // PREVIOUS session's transcript again.
             try? FileManager.default.removeItem(atPath: workPath("sori_out.txt"))
             guard FileManager.default.fileExists(atPath: url.path) else {
@@ -2385,37 +2444,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 return
             }
-            let prompt = cfg.combinedPrompt   // user name hints + AI/dev vocabulary
-            // Resolve "auto" BEFORE decoding, prompt-free (see detectLanguage). An explicit
-            // language makes the English prompt bias style only, never the output language.
-            var lang = cfg.lang
-            if lang == "auto", let detected = detectLanguage(url.path) {
-                lang = detected
-                wlog("language pre-detected: \(detected)")
-            }
-            var text = ""
-            var viaServer = false
-            if cfg.warmEngine ?? true {
-                WhisperServer.ensureRunning(modelPath: model)
-                if let t = WhisperServer.transcribe(wav: url.path, lang: lang, prompt: prompt) {
-                    text = t; viaServer = true
-                    wlog("transcribed via warm server")
-                }
-            }
-            if !viaServer {
-                var args = ["-m", model, "-l", lang, "-otxt", "-of", workPath("sori_out"), url.path]
-                if !prompt.isEmpty {
-                    args += ["--prompt", prompt]   // bias whisper toward names + modern AI terms
-                }
-                wlog("whisper args: \(args.joined(separator: " "))")
-                let task = Process()
-                task.launchPath = whisperTool("whisper-cli"); task.arguments = args
-                let pipe = Pipe(); task.standardError = pipe
-                do { try task.run() } catch { wlog("whisper-cli launch failed: \(error)") }
-                task.waitUntilExit()
+            // "auto" is passed straight through: Qwen3-ASR does its own language ID
+            // across 52 languages, so the old ggml-base pre-detection pass is gone.
+            let lang = cfg.lang == "auto" ? "" : cfg.lang
+            // Vocabulary bias, capped at Config.maxBiasTerms. The Settings "Names &
+            // custom words" field and the AI-terminology checkbox both feed this — they
+            // were dead between the engine swap and 2026-08-12 (he spotted it in the UI).
+            let vocabulary = cfg.biasPrompt
 
-                text = (try? String(contentsOfFile: workPath("sori_out.txt"), encoding: .utf8))?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            QwenServer.ensureRunning(modelPath: repo)
+            var text = ""
+            if let t = QwenServer.transcribe(wav: url.path, lang: lang, vocabulary: vocabulary) {
+                text = t
+                wlog("transcribed via qwen (lang=\(lang.isEmpty ? "auto" : lang))")
+            } else {
+                // No silent degradation: there is no second engine by design, so a
+                // dead engine has to be visible rather than paste nothing and look
+                // like the hotkey missed.
+                wlog("qwen engine UNAVAILABLE — no transcript produced")
+                DispatchQueue.main.async {
+                    if !self.isRecording { self.setStatusIcon("exclamationmark.triangle", tint: .systemRed) }
+                    self.panel.hide()
+                    if submit { self.postEnter("forwarded — ASR engine down") }
+                }
+                return
             }
             let raw = text
             let silenceArtifacts: Set<String> = [

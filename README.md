@@ -12,12 +12,12 @@
 
 ---
 
-Hold Right ⌘, speak, release. The text lands at your cursor, in whatever app has focus. Whisper runs locally on your machine; audio is never uploaded.
+Hold Right ⌘, speak, release. The text lands at your cursor, in whatever app has focus. Qwen3-ASR runs locally on your machine; audio is never uploaded.
 
 ## Why Sori
 
-- **Bilingual for real.** Most Whisper apps break on code-switched speech: Korean with an English term in the middle comes back translated or transliterated. Sori pins the language before decoding (details below), so 한국어, English, and mixed sentences all survive intact.
-- **Fast.** A resident whisper-server keeps the model in RAM: 0.3-0.6s per dictation on Apple Silicon, instead of 1.1-1.3s when the model reloads on every press.
+- **Bilingual for real.** Most dictation apps break on code-switched speech: Korean with an English term in the middle comes back translated or transliterated. Measured on an 8-line Korean/English script scored over 13 technical terms: Qwen3-ASR 11-12/13, whisper large-v3-turbo 8/13 (with a vocabulary glossary), Apple's on-device SpeechAnalyzer 1/13 — the last one dropped an entire English sentence, because its API pins one locale per transcriber and a Korean-only model transliterates the English.
+- **Fast.** A resident engine process keeps the model in RAM: 0.3-0.4s per dictation on Apple Silicon. Loading per keypress instead would cost ~9s, almost all of it Python interpreter startup.
 - **Clean output.** Fillers ("um", "음", "어") are stripped and self-corrections resolve to what you meant: "목요일에... 아니다, 금요일에" pastes as 금요일에. An optional second pass on Groq's free tier fixes grammar and punctuation, with a guard that pastes your raw words if the model misbehaves.
 - **Free and private.** No subscription, no account, no telemetry. The only optional network call is the cleanup step, and it can be toggled off in the menu bar.
 
@@ -31,7 +31,9 @@ Enter while recording stops, transcribes, and submits. Escape cancels. Mis-heard
 
 ## Install
 
-**Prebuilt:** download the zip from [Releases](https://github.com/keonheek/sori/releases), unzip into `/Applications`, right-click > Open on first launch. Then follow step 4 in the release notes to install whisper-cpp and the models.
+**Prebuilt:** download the zip from [Releases](https://github.com/keonheek/sori/releases), unzip into `/Applications`, right-click > Open on first launch. Note that the prebuilt zips predate the Qwen3-ASR engine — build from source below until a new release is cut.
+
+**Requirements:** Apple Silicon (the engine runs on MLX), Python 3, and Homebrew. `install.sh` creates `~/.sori-venv`, installs `mlx-audio`, and pulls the ~1.9GB Qwen3-ASR weights. whisper-cpp is still installed: the live-preview partials use it.
 
 **From source:**
 
@@ -59,16 +61,17 @@ From a terminal, without the menu:
 
 ## Configuration
 
-Settings live in the menu-bar menu and in `~/.sori.conf` (JSON): model, language (`auto` recommended), vocabulary hints, warm engine, cleanup toggles. Vocabulary is truncated from the back at ~223 tokens, so put the names you actually say near the front. For the optional AI cleanup, put a [free Groq API key](https://console.groq.com) in `~/.sori-groq` and enable "AI Cleanup" in the menu.
+Settings live in the menu-bar menu and in `~/.sori.conf` (JSON): model (a Qwen3-ASR MLX repo id), language (`auto` recommended — the engine identifies language itself across 52 languages), vocabulary hints, warm engine, cleanup toggles. The vocabulary bias is capped at 12 terms and names are sent first; see the design note below on why the cap matters. For the optional AI cleanup, put a [free Groq API key](https://console.groq.com) in `~/.sori-groq` and enable "AI Cleanup" in the menu.
 
 ## Design notes
 
-Four problems that shaped the architecture, documented because they will bite anyone building on Whisper:
+Problems that shaped the architecture, documented because they will bite anyone building a dictation app:
 
-- **Language auto-detect is poisoned by the vocabulary prompt.** An English glossary biases Whisper into detecting Korean speech as English, and then it *translates* rather than mis-transcribes ("발표는 목요일에" → "The announcement is Monday"). Sori detects language in a separate prompt-free pass (base model, ~0.2s, p>0.98), then transcribes with the language pinned. The prompt then influences spelling, never language.
-- **whisper-server defaults to greedy decoding** (`beam-size -1`) while whisper-cli defaults to beam search 5. Greedy is what produces the "Monday, Monday, Monday" repetition loop on non-English audio. Sori spawns the server with `-bs 5 -bo 5` for CLI-quality output at server speed.
+- **A vocabulary bias list is a strong prior, and a long one hurts.** Any brand in the list can be substituted for one that isn't. Scored on the same 13 terms: no bias 11/13; a 9-term hand-picked list 12/13; a 44-term glossary 11/13 but it rendered "Qwen 3.6" as "Claude 3.6" — Claude was first in the list. Capping that glossary at its first 12 entries was *worse still*, 7/13, because the cap kept exactly the competing brand and dropped the useful terms. Sori sends names first and caps the total; the honest default for a general glossary is off.
+- **Language auto-detect used to be poisoned by the vocabulary prompt.** Under Whisper, an English glossary biased detection toward English on Korean speech, and it then *translated* rather than mis-transcribed ("발표는 목요일에" → "The announcement is Monday"), which forced a separate prompt-free detection pass. Qwen3-ASR takes no style prompt and identifies language itself, so that whole pass — and that failure — is gone.
+- **whisper-server defaults to greedy decoding** (`beam-size -1`) while whisper-cli defaults to beam search 5. Greedy is what produces the "Monday, Monday, Monday" repetition loop on non-English audio; even with beam search the loop recurred often enough to need a collapse pass. It has not reappeared under Qwen3-ASR.
 - **An instruct LLM will answer dictation that sounds like a request** instead of cleaning it, replying "I can clean up the text for you..." straight into the text field. Prompt framing (transcript in tags, model as pure transform) helps, but the reliable fix is structural output validation: same language as input, sane length ratio, no assistant phrases. Any failure falls back to the raw transcript.
-- **Whisper keeps only the last 223 prompt tokens**, and dense proper nouns tokenize at ~2.4 chars each, not 4. A long glossary silently cuts the names hint off the head of the prompt.
+- **Whisper keeps only the last 223 prompt tokens**, and dense proper nouns tokenize at ~2.4 chars each, not 4. A long glossary silently cut the names hint off the head of the prompt — the reason Sori's glossary was ordered by frequency, which later became a liability when that same ordering was reused as a bias list.
 
 ## Windows (experimental)
 
@@ -90,7 +93,7 @@ macOS ties Accessibility/Input Monitoring grants to the code signature, and ad-h
 
 macOS 11+ (universal: Apple Silicon and Intel) · Xcode Command Line Tools · Homebrew · ~2 GB disk for models · ~1.7 GB RAM while the warm engine is loaded (`warmEngine: false` to go without)
 
-Built on [whisper.cpp](https://github.com/ggml-org/whisper.cpp). One Swift file, no Xcode project, no dependencies beyond whisper-cpp itself.
+Built on [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) via [mlx-audio](https://github.com/Blaizzy/mlx-audio), with [whisper.cpp](https://github.com/ggml-org/whisper.cpp) still driving the live-preview partials. One Swift file plus a small Python engine server; no Xcode project.
 
 ## License
 
