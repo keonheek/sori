@@ -104,10 +104,10 @@ class Handler(BaseHTTPRequestHandler):
             # unchanged at 11/12, and a plausible wrong brand is worse than an
             # implausible one because it survives proofreading. Sori therefore
             # leaves this empty by default; the plumbing stays for experiments.
-            kwargs["system_prompt"] = (
-                "Vocabulary that may appear in the audio, spell these exactly: "
-                + req["context"]
-            )
+            # Passed through verbatim: Sori builds the full sentence (and applies the
+            # term cap) in Config.biasPrompt, so wrapping it again here would nest
+            # two instruction prefixes.
+            kwargs["system_prompt"] = req["context"]
 
         try:
             t0 = time.time()

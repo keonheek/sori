@@ -82,10 +82,36 @@ struct Config: Codable {
     // the anchor leaking into transcripts of silence (whisper echoes prompt text).
     static let styleAnchor = "Okay, so here's the plan: first we test it, then we ship it. Sounds good, right? Great — let's begin."
 
-    // Combined whisper --prompt. ORDER MATTERS: whisper keeps only the LAST 223 prompt
-    // tokens and silently drops the head. So: glossary first (first to be sacrificed),
-    // Names just before the end (must survive — it's the whole point of the hint), style
-    // anchor last (tokens nearest the audio pull style hardest).
+    // Bias prompt for Qwen3-ASR (`system_prompt`). Replaced the whisper --prompt builder
+    // 2026-08-12.
+    //
+    // THE CAP IS THE WHOLE POINT — measured on the 8-line bilingual clip, scoring 13 terms:
+    //   no bias          11/13, 0 duplications, no hallucination  (missed Groq AND Qwen)
+    //   9-term list      12/13, 1 duplication,  no hallucination  (fixed Groq AND Qwen)
+    //   full 44-term     11/13, 1 duplication,  hallucinated "Claude 3.6" for "Qwen 3.6"
+    // A long list makes the model reach for whatever brand sits nearest the top (Claude was
+    // first in the glossary). Names go FIRST because they are the ones no model can guess;
+    // the AI glossary fills whatever budget is left.
+    static let maxBiasTerms = 12
+
+    var biasPrompt: String {
+        var terms: [String] = []
+        let hint = promptHint.trimmingCharacters(in: .whitespaces)
+        if !hint.isEmpty {
+            terms += hint.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+        if (aiTermsEnabled ?? true), let t = aiTerms?.trimmingCharacters(in: .whitespaces), !t.isEmpty {
+            terms += t.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+        terms = terms.filter { !$0.isEmpty }
+        guard !terms.isEmpty else { return "" }
+        let capped = Array(terms.prefix(Config.maxBiasTerms))
+        return "Vocabulary that may appear in the audio, spell these exactly: "
+             + capped.joined(separator: ", ")
+    }
+
+    // Kept only so the old whisper prompt builder below still compiles for reference during
+    // the transition; nothing calls it. Remove once the Qwen lane has a few weeks on it.
     var combinedPrompt: String {
         let anchor = Config.styleAnchor
         let hint = promptHint.trimmingCharacters(in: .whitespaces)
@@ -1598,13 +1624,19 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
         let H = p.bounds.height
         sectionHeader("General", p, H - 56)
 
+        // Lists Qwen3-ASR MLX quants, not ggml files. Before 2026-08-12 this listed
+        // ~/.sori-models/*.bin and wrote cfg.model — which nothing had read since the
+        // engine swap, so the pane confidently displayed a model that was not running.
         fieldLabel("Model", p, H - 100)
         modelPopup = NSPopUpButton(frame: NSRect(x: 28, y: H - 128, width: 300, height: 26))
-        let models = (try? FileManager.default.contentsOfDirectory(atPath:
-            (NSHomeDirectory() as NSString).appendingPathComponent(".sori-models")))?
-            .filter { $0.hasSuffix(".bin") }.sorted() ?? [cfg.model]
-        modelPopup.addItems(withTitles: models)
-        modelPopup.selectItem(withTitle: cfg.model)
+        let repos = [
+            "mlx-community/Qwen3-ASR-1.7B-8bit",   // default: best accuracy/size on this Mac
+            "mlx-community/Qwen3-ASR-1.7B-4bit",   // smaller/faster, untested here
+            "mlx-community/Qwen3-ASR-0.6B-8bit",   // fallback for low memory, untested here
+        ]
+        let current = cfg.asrModel ?? QwenServer.defaultRepo
+        modelPopup.addItems(withTitles: repos.contains(current) ? repos : repos + [current])
+        modelPopup.selectItem(withTitle: current)
         p.addSubview(modelPopup)
 
         fieldLabel("Language", p, H - 168)
@@ -1748,7 +1780,7 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
         // sitting in the field editor is lost — clicking Save (or pressing Enter, which
         // hits this button's \r key-equivalent BEFORE the cell commits) saved stale rows.
         window?.makeFirstResponder(nil)
-        cfg.model = modelPopup.titleOfSelectedItem ?? cfg.model
+        cfg.asrModel = modelPopup.titleOfSelectedItem ?? cfg.asrModel
         cfg.lang = langPopup.titleOfSelectedItem ?? cfg.lang
         cfg.promptHint = hintField.stringValue
         cfg.sound = soundCheck.state == .on
@@ -1763,7 +1795,7 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
         // user saw and edited is now canonical in `replacements`.
         cfg.learnedReplacements = []
         cfg.save()
-        wlog("settings saved: \(cfg.replacements.count) corrections, model=\(cfg.model), pressEnter=\(cfg.pressEnter ?? false), panelStyle=\(cfg.panelStyle ?? "classic")")
+        wlog("settings saved: \(cfg.replacements.count) corrections, model=\(cfg.asrModel ?? QwenServer.defaultRepo), pressEnter=\(cfg.pressEnter ?? false), panelStyle=\(cfg.panelStyle ?? "classic")")
         LoginItem.set(enabled: loginCheck.state == .on)
         onSave?(cfg)
         window?.close()
@@ -2415,11 +2447,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // "auto" is passed straight through: Qwen3-ASR does its own language ID
             // across 52 languages, so the old ggml-base pre-detection pass is gone.
             let lang = cfg.lang == "auto" ? "" : cfg.lang
-            // Vocabulary bias is OFF by default and this stays empty — measured
-            // 2026-08-12, biasing fixed "Groq" but turned "Qwen 3.6" into
-            // "Claude 3.6". Opt in by setting aiTermsEnabled true AND asrBias true.
-            let vocabulary = (cfg.asrBias ?? false) && (cfg.aiTermsEnabled ?? true)
-                ? (cfg.aiTerms ?? "") : ""
+            // Vocabulary bias, capped at Config.maxBiasTerms. The Settings "Names &
+            // custom words" field and the AI-terminology checkbox both feed this — they
+            // were dead between the engine swap and 2026-08-12 (he spotted it in the UI).
+            let vocabulary = cfg.biasPrompt
 
             QwenServer.ensureRunning(modelPath: repo)
             var text = ""
