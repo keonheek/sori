@@ -69,6 +69,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 rm -f "$APP/Contents/MacOS/Sori"
 cp Sori "$APP/Contents/MacOS/Sori"
 cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+# The engine script ships INSIDE the bundle so the app never depends on where the
+# source checkout lives (it used to fall back to a hard-coded ~/Dev/sori).
+cp engine/qwen_server.py "$APP/Contents/Resources/qwen_server.py"
 cat > "$APP/Contents/Info.plist" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -124,6 +127,8 @@ cat > "$PLIST" <<PLIST_EOF
     <key>ProgramArguments</key>
     <array><string>$APP/Contents/MacOS/Sori</string></array>
     <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>ThrottleInterval</key><integer>5</integer>
 </dict></plist>
 PLIST_EOF
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true

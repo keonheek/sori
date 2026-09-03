@@ -113,7 +113,8 @@ class Handler(BaseHTTPRequestHandler):
             t0 = time.time()
             with _lock:
                 r = _model.generate(path, **kwargs)
-            text = (getattr(r, "text", None) or str(r)).strip()
+            raw = getattr(r, "text", None)
+            text = (raw if raw is not None else str(r)).strip()
             log(f"inference {time.time() - t0:.2f}s -> {len(text)} chars")
             self._send(200, {"text": text})
         except TypeError:
@@ -123,7 +124,8 @@ class Handler(BaseHTTPRequestHandler):
                 kwargs.pop("system_prompt", None)
                 with _lock:
                     r = _model.generate(path, **kwargs)
-                text = (getattr(r, "text", None) or str(r)).strip()
+                raw = getattr(r, "text", None)
+                text = (raw if raw is not None else str(r)).strip()
                 self._send(200, {"text": text})
             except Exception as e:                           # noqa: BLE001
                 self._send(500, {"error": f"{type(e).__name__}: {e}"})

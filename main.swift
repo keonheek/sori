@@ -160,11 +160,19 @@ struct Config: Codable {
 
     // Apply find-replace pairs to transcribed text (whole-word, case-insensitive).
     // Includes both manual replacements and auto-learned ones.
+    //
+    // NOT `\b…\b` (2026-09-03): a rule whose `from` ends in punctuation or a quote
+    // ("Skku.", "\"cacao talk\"") never matched, because `\b` after "." needs a word char
+    // on the far side, and a sentence ends there. And ICU counts Hangul as \w, so an
+    // English term glued to a Korean particle ("SDIC를") had no boundary either — the
+    // rules were dead exactly in the bilingual case Sori exists for. Guard on LATIN
+    // alphanumerics only: no Latin letter/digit may touch the match on either side, so
+    // "bully" still cannot fire inside "bbully", but "SDIC를" and "Skku." both do.
     func applyReplacements(_ text: String) -> String {
         var out = text
         let all = replacements + (learnedReplacements ?? [])
         for r in all where !r.from.isEmpty {
-            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: r.from) + "\\b"
+            let pattern = "(?<![A-Za-z0-9])" + NSRegularExpression.escapedPattern(for: r.from) + "(?![A-Za-z0-9])"
             if let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
                 out = re.stringByReplacingMatches(in: out, range: NSRange(out.startIndex..., in: out), withTemplate: r.to)
             }
@@ -421,6 +429,12 @@ enum QwenServer {
         // checkout so `swiftc main.swift && ./main` works during development.
         let bundled = Bundle.main.bundlePath + "/Contents/Resources/qwen_server.py"
         if FileManager.default.fileExists(atPath: bundled) { return bundled }
+        // install.sh records the source checkout in ~/.sori-src; a clone anywhere other
+        // than ~/Dev/sori used to get "qwen engine MISSING" here (2026-09-03).
+        if let src = Updater.sourceRepo() {
+            let p = (src as NSString).appendingPathComponent("engine/qwen_server.py")
+            if FileManager.default.fileExists(atPath: p) { return p }
+        }
         return (NSHomeDirectory() as NSString).appendingPathComponent("Dev/sori/engine/qwen_server.py")
     }
     private static var proc: Process?
@@ -2470,10 +2484,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             let raw = text
+            // Whisper-era list, trimmed 2026-09-03: Qwen3-ASR returns "" on silence (every
+            // blank recording in the log since the engine swap came back 0 chars), so the
+            // single common words whisper used to hallucinate — "okay", "ok", "so", "you",
+            // "bye" — are no longer artifacts, they are dictations ("Okay." into a chat box
+            // was being dropped as "no speech"). Bracket tokens and YouTube sign-offs stay.
             let silenceArtifacts: Set<String> = [
                 "[blank_audio]", "(silence)", "[silence]", "[ silence ]", "[music]", "(music)",
-                "thank you", "thank you so much", "thanks for watching", "thanks for watching!",
-                "please subscribe", "you", "bye", "bye-bye", "okay", "ok", "so", "uh", "um", "mm",
+                "thank you so much", "thanks for watching", "thanks for watching!",
+                "please subscribe", "uh", "um", "mm",
                 "subtitles by", "transcription by", "amara.org", "♪",
             ]
 
