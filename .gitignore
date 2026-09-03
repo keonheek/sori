@@ -4,3 +4,5 @@ Sori
 AppIcon.iconset/
 build/
 Sori.prev
+tests/eval/personal/
+tests/eval/smoke/*.wav

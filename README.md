@@ -33,7 +33,7 @@ Enter while recording stops, transcribes, and submits. Escape cancels. Mis-heard
 
 **Prebuilt:** download the zip from [Releases](https://github.com/keonheek/sori/releases), unzip into `/Applications`, right-click > Open on first launch. Note that the prebuilt zips predate the Qwen3-ASR engine — build from source below until a new release is cut.
 
-**Requirements:** Apple Silicon (the engine runs on MLX), Python 3, and Homebrew. `install.sh` creates `~/.sori-venv`, installs `mlx-audio`, and pulls the ~1.9GB Qwen3-ASR weights. whisper-cpp is still installed: the live-preview partials use it.
+**Requirements:** Apple Silicon (the engine runs on MLX), Python 3, and Homebrew. `install.sh` creates `~/.sori-venv`, installs `mlx-audio` and `ten-vad`, and pulls the ~1.9GB Qwen3-ASR weights. whisper-cpp is still installed: the live-preview partials use it.
 
 **From source:**
 
@@ -63,10 +63,18 @@ From a terminal, without the menu:
 
 Settings live in the menu-bar menu and in `~/.sori.conf` (JSON): model (a Qwen3-ASR MLX repo id), language (`auto` recommended — the engine identifies language itself across 52 languages), vocabulary hints, warm engine, cleanup toggles. The vocabulary bias is capped at 12 terms and names are sent first; see the design note below on why the cap matters. For the optional AI cleanup, put a [free Groq API key](https://console.groq.com) in `~/.sori-groq` and enable "AI Cleanup" in the menu.
 
+## Diagnostics
+
+The log is `~/Library/Logs/Sori/sori.log` (rotated at 2 MB into `sori.log.1`). Every dictation writes its raw and final text there, plus the engine's inference time and how much speech the voice-activity gate found. If Right ⌘ ever goes dead, that file says why: a disabled event tap, secure input left on by the lock screen, a missing venv, or an engine that had to be respawned.
+
+`tests/eval/` scores the engine on your own clips (CER for Korean, WER for English, both over code-switched lines). Run it before and after changing the model, the vocabulary, or the cleanup rules; see its README.
+
 ## Design notes
 
 Problems that shaped the architecture, documented because they will bite anyone building a dictation app:
 
+- **Gate on a real VAD before the model, not on what the model says about silence.** Qwen3-ASR returns an empty string on a blank clip, which is honest, but it still costs a full inference and Whisper before it returned "Thank you." Sori now runs TEN-VAD (Apache-2.0, about 13 ms per second of audio) inside the engine and skips inference when a clip holds under 200 ms of speech, so an accidental tap never reaches the model. Silero's ONNX build was tried first and scored 0.12 on clear synthesized speech under its documented input contract, so it was not adopted.
+- **A hung inference must kill the engine, not hold the lock.** MLX generate is serialized behind one lock; a single stuck call would have made every later dictation wait out the 60 s client timeout. The server now runs generate on a worker thread and exits if it exceeds 45 s; Sori respawns it on the next request, and launchd relaunches Sori itself if it ever crashes.
 - **A vocabulary bias list is a strong prior, and a long one hurts.** Any brand in the list can be substituted for one that isn't. Scored on the same 13 terms: no bias 11/13; a 9-term hand-picked list 12/13; a 44-term glossary 11/13 but it rendered "Qwen 3.6" as "Claude 3.6" — Claude was first in the list. Capping that glossary at its first 12 entries was *worse still*, 7/13, because the cap kept exactly the competing brand and dropped the useful terms. Sori sends names first and caps the total; the honest default for a general glossary is off.
 - **Language auto-detect used to be poisoned by the vocabulary prompt.** Under Whisper, an English glossary biased detection toward English on Korean speech, and it then *translated* rather than mis-transcribed ("발표는 목요일에" → "The announcement is Monday"), which forced a separate prompt-free detection pass. Qwen3-ASR takes no style prompt and identifies language itself, so that whole pass — and that failure — is gone.
 - **whisper-server defaults to greedy decoding** (`beam-size -1`) while whisper-cli defaults to beam search 5. Greedy is what produces the "Monday, Monday, Monday" repetition loop on non-English audio; even with beam search the loop recurred often enough to need a collapse pass. It has not reappeared under Qwen3-ASR.

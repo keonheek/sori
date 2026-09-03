@@ -23,20 +23,36 @@ func ensureWorkDir() -> Bool {
                                                      attributes: [.posixPermissions: 0o700])) != nil
 }
 func workPath(_ name: String) -> String { (soriWorkDir as NSString).appendingPathComponent(name) }
-let logPath = workPath("sori.log")
+// The log lives in ~/Library/Logs/Sori, NOT in the work dir: macOS's temp cleaner was
+// purging it, so every incident older than ~3 days had no history (moved 2026-09-03).
+// Rotated once past 2 MB into sori.log.1, which is overwritten on the next rotation.
+let soriLogDir: String = {
+    let d = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/Sori")
+    try? FileManager.default.createDirectory(atPath: d, withIntermediateDirectories: true)
+    return d
+}()
+let logPath = (soriLogDir as NSString).appendingPathComponent("sori.log")
+let logRotateBytes: UInt64 = 2_000_000
 let wlogDF: DateFormatter = {
     let d = DateFormatter(); d.dateFormat = "MM-dd HH:mm:ss.SSS"; return d
 }()
+let wlogLock = NSLock()
 func wlog(_ msg: String) {
-    ensureWorkDir()
     let line = wlogDF.string(from: Date()) + " " + msg + "\n"
-    if let data = line.data(using: .utf8) {
-        if FileManager.default.fileExists(atPath: logPath),
-           let fh = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-            fh.seekToEndOfFile(); fh.write(data); try? fh.close()
-        } else {
-            try? line.write(toFile: logPath, atomically: true, encoding: .utf8)
-        }
+    guard let data = line.data(using: .utf8) else { return }
+    wlogLock.lock(); defer { wlogLock.unlock() }
+    if let size = (try? FileManager.default.attributesOfItem(atPath: logPath))?[.size] as? UInt64,
+       size > logRotateBytes {
+        let prev = logPath + ".1"
+        try? FileManager.default.removeItem(atPath: prev)
+        try? FileManager.default.moveItem(atPath: logPath, toPath: prev)
+    }
+    if FileManager.default.fileExists(atPath: logPath),
+       let fh = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
+        fh.seekToEndOfFile(); fh.write(data); try? fh.close()
+    } else {
+        try? FileManager.default.createDirectory(atPath: soriLogDir, withIntermediateDirectories: true)
+        try? line.write(toFile: logPath, atomically: true, encoding: .utf8)
     }
 }
 
@@ -484,7 +500,8 @@ enum QwenServer {
         }
         let t = Process()
         t.launchPath = pythonPath
-        t.arguments = [serverScript, "--port", String(port), "--model", modelPath]
+        t.arguments = [serverScript, "--port", String(port), "--model", modelPath,
+                       "--allow-dir", soriWorkDir]
         t.standardOutput = FileHandle.nullDevice
         // Keep stderr: the server logs model-load failures there, and a silent
         // engine is the one failure mode that looks identical to a dead hotkey.
@@ -513,8 +530,19 @@ enum QwenServer {
     // `vocabulary` is the aiTerms glossary and is normally EMPTY — see the note in
     // qwen_server.py: biasing fixed "Groq" but hallucinated "Qwen 3.6" into
     // "Claude 3.6", which is a worse error because it survives proofreading.
+    // Blocks until the server answers 200 on "/", or `limit` seconds pass. Used for the
+    // first dictation after launch: the model takes ~2-3 s to load and used to fail
+    // that dictation outright with "engine UNAVAILABLE" (2026-09-03).
+    static func waitHealthy(limit: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(limit)
+        while Date() < deadline {
+            if healthy() { return true }
+            usleep(400_000)
+        }
+        return false
+    }
+
     static func transcribe(wav: String, lang: String, vocabulary: String = "") -> String? {
-        guard healthy() else { return nil }
         guard let url = URL(string: "http://127.0.0.1:\(port)/inference") else { return nil }
         var payload: [String: String] = ["path": wav]
         if !lang.isEmpty && lang != "auto" { payload["language"] = lang }
@@ -527,26 +555,39 @@ enum QwenServer {
         req.httpBody = body
         req.timeoutInterval = 60   // generous: long recordings
 
-        let sem = DispatchSemaphore(value: 0)
-        var out: String? = nil
-        URLSession.shared.dataTask(with: req) { data, _, err in
-            defer { sem.signal() }
-            if let err = err { wlog("qwen_server inference error: \(err)"); return }
-            guard let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-            if let e = json["error"] as? String { wlog("qwen_server inference failed: \(e)"); return }
-            guard let t = json["text"] as? String else { return }
-            out = t.trimmingCharacters(in: .whitespacesAndNewlines)
-        }.resume()
-        _ = sem.wait(timeout: .now() + 61)
-        return out
+        // One retry, only for "still loading" (503) or "not up yet" (connection refused):
+        // both mean the engine is on its way, not broken.
+        for attempt in 0..<2 {
+            let sem = DispatchSemaphore(value: 0)
+            var out: String? = nil
+            var retryable = false
+            URLSession.shared.dataTask(with: req) { data, resp, err in
+                defer { sem.signal() }
+                if let err = err {
+                    retryable = (err as NSError).code == NSURLErrorCannotConnectToHost
+                    wlog("qwen_server inference error: \(err)"); return
+                }
+                if (resp as? HTTPURLResponse)?.statusCode == 503 { retryable = true }
+                guard let data = data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+                if let e = json["error"] as? String { wlog("qwen_server inference failed: \(e)"); return }
+                guard let t = json["text"] as? String else { return }
+                out = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            }.resume()
+            _ = sem.wait(timeout: .now() + 61)
+            if let out { return out }
+            guard attempt == 0, retryable else { return nil }
+            wlog("engine not ready — waiting for health before one retry")
+            guard waitHealthy(limit: 15) else { return nil }
+        }
+        return nil
     }
 }
 
 // MARK: - Version + updates
 // THE single source of truth for the version. install.sh and make-release.sh both grep this
 // line for the bundle plist and the release zip name, so there is exactly one number to bump.
-let soriVersion = "1.0.4"
+let soriVersion = "1.0.5"
 
 // "Check for Updates…" — what it can actually do depends on how Sori was installed, because
 // macOS ties Accessibility/Input Monitoring grants to the code signature:
@@ -2185,11 +2226,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         delegate.cancelRecording()
                         return nil   // consume Escape
                     }
-                    if delegate.rightCmdDown { delegate.otherKeyDuringCmd = true }
+                    delegate.noteChord()
                     return Unmanaged.passRetained(event)
                 }
                 guard keycode == 54 else {
-                    if delegate.rightCmdDown { delegate.otherKeyDuringCmd = true }
+                    delegate.noteChord()
                     return Unmanaged.passRetained(event)
                 }
                 let isDown = event.flags.contains(.maskCommand)
@@ -2244,6 +2285,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             wlog("event tap FAILED — retrying in 2s")
             setStatusIcon("exclamationmark.triangle.fill", tint: .systemYellow)
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.installTap() }
+        }
+    }
+
+    // Right ⌘ used as a modifier (Right ⌘+C, Right ⌘+Shift, …) while the press that
+    // started a recording is still down: that press was a shortcut, not a dictation.
+    // Before 2026-09-03 the release was ignored and the recording ran on until the
+    // next tap. Cancel it the moment the chord appears — nothing has been pasted yet.
+    func noteChord() {
+        guard rightCmdDown else { return }
+        otherKeyDuringCmd = true
+        if startedThisPress && isRecording {
+            wlog("Right⌘ chord -> cancel the recording this press started")
+            startedThisPress = false
+            cancelRecording()
         }
     }
 

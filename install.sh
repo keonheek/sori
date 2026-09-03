@@ -28,9 +28,9 @@ if [ ! -x "$VENV/bin/python3" ]; then
     echo "-- Creating ASR engine venv at $VENV ..."
     python3 -m venv "$VENV"
 fi
-echo "-- Installing mlx-audio (Qwen3-ASR engine)..."
+echo "-- Installing mlx-audio (Qwen3-ASR engine) + ten-vad (short-tap gate)..."
 "$VENV/bin/pip" install -q --upgrade pip
-"$VENV/bin/pip" install -q mlx-audio
+"$VENV/bin/pip" install -q mlx-audio ten-vad
 "$VENV/bin/python3" -c "import mlx_audio" || { echo "ERROR: mlx-audio install failed"; exit 1; }
 # Pre-pull the weights so the first dictation isn't a 1.9GB download.
 echo "-- Fetching Qwen3-ASR weights (~1.9GB, first run only)..."
@@ -150,7 +150,7 @@ else
     echo ""
     echo "== Installed, but Sori is NOT running. =="
     echo "   Start it with: launchctl kickstart -k gui/$(id -u)/$LABEL"
-    echo "   If that fails, check the log: tail \$(getconf DARWIN_USER_TEMP_DIR)sori/sori.log"
+    echo "   If that fails, check the log: tail ~/Library/Logs/Sori/sori.log"
     exit 1
 fi
 echo ""
