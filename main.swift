@@ -80,6 +80,12 @@ struct Config: Codable {
     var llmCleanup: Bool? = nil          // Tier 2: send to a local/remote LLM for grammar+redundancy rewrite
     var learnedReplacements: [Replacement]? = nil  // auto-learned from your repeated edits
     var learnEdits: Bool? = nil          // watch the clipboard for in-place corrections and learn them
+    // Chunked dictation: while you hold the key, every pause of ~0.45 s commits the audio
+    // so far through the resident engine, so on release only the last few seconds are
+    // left to transcribe. Stop-to-paste stays near the ~0.3 s floor instead of growing
+    // with the length of the recording (2.7 s for ~830 chars measured 2026-09-03).
+    // Default OFF until the eval harness shows the pause-boundary cuts cost no accuracy.
+    var chunkedTranscribe: Bool? = nil
     var livePreview: Bool? = nil         // show live partial transcription in the panel (uses a fast model)
     var partialModel: String? = nil      // model for live preview (default ggml-base.bin — fast)
     var warmEngine: Bool? = nil          // keep whisper-server resident (model stays in RAM; ~4x faster final transcription). CLI fallback when the server is down.
@@ -542,9 +548,41 @@ enum QwenServer {
         return false
     }
 
-    static func transcribe(wav: String, lang: String, vocabulary: String = "") -> String? {
+    // Chunked dictation: ask the engine to commit everything after `offsetMs` up to the
+    // last real pause. Returns (text, committedMs); committedMs == offsetMs means "no pause
+    // yet, nothing committed". One shot, no retry — the timer fires again in a second.
+    static func segment(wav: String, offsetMs: Int, lang: String, vocabulary: String = "") -> (String, Int)? {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/segment") else { return nil }
+        var payload: [String: Any] = ["path": wav, "offset_ms": offsetMs]
+        if !lang.isEmpty && lang != "auto" { payload["language"] = lang }
+        if !vocabulary.isEmpty { payload["context"] = vocabulary }
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+        req.timeoutInterval = 20
+        let sem = DispatchSemaphore(value: 0)
+        var out: (String, Int)? = nil
+        URLSession.shared.dataTask(with: req) { data, _, err in
+            defer { sem.signal() }
+            if let err = err { wlog("segment error: \(err)"); return }
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            if let e = json["error"] as? String { wlog("segment failed: \(e)"); return }
+            guard let t = json["text"] as? String, let c = json["committed_ms"] as? Int else { return }
+            out = (t.trimmingCharacters(in: .whitespacesAndNewlines), c)
+        }.resume()
+        _ = sem.wait(timeout: .now() + 21)
+        return out
+    }
+
+    // `offsetMs` > 0 transcribes only the audio after that point (the uncommitted tail of a
+    // chunked dictation); 0 is the whole file.
+    static func transcribe(wav: String, lang: String, vocabulary: String = "", offsetMs: Int = 0) -> String? {
         guard let url = URL(string: "http://127.0.0.1:\(port)/inference") else { return nil }
-        var payload: [String: String] = ["path": wav]
+        var payload: [String: Any] = ["path": wav]
+        if offsetMs > 0 { payload["offset_ms"] = offsetMs }
         if !lang.isEmpty && lang != "auto" { payload["language"] = lang }
         if !vocabulary.isEmpty { payload["context"] = vocabulary }
         guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
@@ -587,7 +625,7 @@ enum QwenServer {
 // MARK: - Version + updates
 // THE single source of truth for the version. install.sh and make-release.sh both grep this
 // line for the bundle plist and the release zip name, so there is exactly one number to bump.
-let soriVersion = "1.0.5"
+let soriVersion = "1.0.6"
 
 // "Check for Updates…" — what it can actually do depends on how Sori was installed, because
 // macOS ties Accessibility/Input Monitoring grants to the code signature:
@@ -1558,6 +1596,7 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
     private var loginCheck: NSButton!
     private var aiTermsCheck: NSButton!
     private var pressEnterCheck: NSButton!
+    private var chunkedCheck: NSButton!
     private var panelStyleSegment: NSSegmentedControl!
     private var replTable: NSTableView!
 
@@ -1701,25 +1740,29 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
         langPopup.selectItem(withTitle: langs.contains(cfg.lang) ? cfg.lang : "en")
         p.addSubview(langPopup)
 
-        let c = card(p, NSRect(x: 28, y: H - 406, width: p.bounds.width - 56, height: 190))
+        let c = card(p, NSRect(x: 28, y: H - 434, width: p.bounds.width - 56, height: 218))
         let styleLabel = NSTextField(labelWithString: "Floating panel")
         styleLabel.font = .systemFont(ofSize: 12, weight: .medium); styleLabel.textColor = .secondaryLabelColor
-        styleLabel.frame = NSRect(x: 16, y: 154, width: 320, height: 16); c.addSubview(styleLabel)
+        styleLabel.frame = NSRect(x: 16, y: 182, width: 320, height: 16); c.addSubview(styleLabel)
         panelStyleSegment = NSSegmentedControl(labels: ["Classic", "Compact"], trackingMode: .selectOne,
                                                 target: nil, action: nil)
-        panelStyleSegment.frame = NSRect(x: 16, y: 126, width: 220, height: 24)
+        panelStyleSegment.frame = NSRect(x: 16, y: 154, width: 220, height: 24)
         panelStyleSegment.selectedSegment = (cfg.panelStyle == "compact") ? 1 : 0
         c.addSubview(panelStyleSegment)
         let styleHint = NSTextField(labelWithString: "Compact: a small draggable indicator, no live-text preview.")
         styleHint.font = .systemFont(ofSize: 11); styleHint.textColor = .secondaryLabelColor
-        styleHint.frame = NSRect(x: 16, y: 106, width: c.bounds.width - 32, height: 16); c.addSubview(styleHint)
+        styleHint.frame = NSRect(x: 16, y: 134, width: c.bounds.width - 32, height: 16); c.addSubview(styleHint)
         loginCheck = NSButton(checkboxWithTitle: "  Launch at login", target: nil, action: nil)
-        loginCheck.frame = NSRect(x: 16, y: 74, width: 320, height: 22)
+        loginCheck.frame = NSRect(x: 16, y: 102, width: 320, height: 22)
         loginCheck.state = LoginItem.isEnabled() ? .on : .off; c.addSubview(loginCheck)
         pressEnterCheck = NSButton(checkboxWithTitle: "  Press Enter after pasting (submit automatically)",
                                    target: nil, action: nil)
-        pressEnterCheck.frame = NSRect(x: 16, y: 46, width: 360, height: 22)
+        pressEnterCheck.frame = NSRect(x: 16, y: 74, width: 360, height: 22)
         pressEnterCheck.state = (cfg.pressEnter ?? false) ? .on : .off; c.addSubview(pressEnterCheck)
+        chunkedCheck = NSButton(checkboxWithTitle: "  Transcribe while you talk (commit at each pause — faster paste on long dictations)",
+                                target: nil, action: nil)
+        chunkedCheck.frame = NSRect(x: 16, y: 46, width: c.bounds.width - 32, height: 22)
+        chunkedCheck.state = (cfg.chunkedTranscribe ?? false) ? .on : .off; c.addSubview(chunkedCheck)
         let hint = NSTextField(labelWithString: "Hold Right ⌘ to talk, or tap to start and tap again to stop. Right ⌘ + Enter sends. Text stays on the clipboard — press ⌘V to recover it.")
         hint.font = .systemFont(ofSize: 11); hint.textColor = .secondaryLabelColor
         hint.frame = NSRect(x: 16, y: 10, width: c.bounds.width - 32, height: 30)
@@ -1841,6 +1884,7 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
         cfg.sound = soundCheck.state == .on
         cfg.aiTermsEnabled = aiTermsCheck.state == .on
         cfg.pressEnter = pressEnterCheck.state == .on
+        cfg.chunkedTranscribe = chunkedCheck.state == .on
         cfg.panelStyle = panelStyleSegment.selectedSegment == 1 ? "compact" : "classic"
         // Drop rows with an empty "heard" side (they can never match anything).
         cfg.replacements = cfg.replacements.filter {
@@ -2364,12 +2408,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // purely to produce text nothing displayed. 1289 discarded passes over one 9-hour session,
         // and because they are children of Sori.app they roll up into the battery menu's "Apps
         // Using Significant Energy" entry for Sori (diagnosed 2026-08-10).
-        if (cfg.livePreview ?? false) && panel.style != "compact" { startPartialTimer() }
+        if cfg.chunkedTranscribe ?? false {
+            startChunkTimer()
+        } else if (cfg.livePreview ?? false) && panel.style != "compact" { startPartialTimer() }
     }
 
     func cancelRecording() {
         isRecording = false; wlog(">>> cancelRecording (ESC)")
         stopPartialTimer()
+        stopChunkTimer()
         recorder.cancel()
         DispatchQueue.main.async {
             self.setStatusIcon("mic")
@@ -2451,6 +2498,57 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         catch { wlog("rebuildPartialWav write failed: \(error)"); return false }
     }
 
+    // Chunked dictation state for ONE recording. A fresh object per recording so a final
+    // transcription still queued from the previous dictation cannot read the next one's
+    // committed text (transcription is async; recordings can overlap it).
+    final class ChunkSession {
+        var committedMs = 0
+        var text = ""
+        var snapshots = 0
+    }
+    private var chunk: ChunkSession?
+    private var chunkTimer: DispatchSourceTimer?
+    private var chunkRunning = false
+    // Serial: the final transcribe drains it with a sync barrier before reading the session.
+    private let chunkQueue = DispatchQueue(label: "sori.chunk", qos: .utility)
+
+    private func startChunkTimer() {
+        let session = ChunkSession()
+        chunk = session
+        let cfg = self.cfg
+        let lang = cfg.lang == "auto" ? "" : cfg.lang
+        let vocabulary = cfg.biasPrompt
+        wlog("chunk timer START")
+        // Make sure the engine is up before the first pause arrives; a cold engine on the
+        // first tick would just return nothing and the tail path picks everything up.
+        DispatchQueue.global(qos: .utility).async { QwenServer.ensureRunning(modelPath: cfg.asrModel ?? QwenServer.defaultRepo) }
+        let t = DispatchSource.makeTimerSource(queue: chunkQueue)
+        t.schedule(deadline: .now() + 1.0, repeating: 1.0)
+        t.setEventHandler { [weak self] in
+            guard let self, self.isRecording, self.chunk === session, !self.chunkRunning else { return }
+            let wav = workPath("sori.wav")
+            guard let sz = try? FileManager.default.attributesOfItem(atPath: wav)[.size] as? Int,
+                  sz > 44 + (session.committedMs + 3000) * 32 else { return }   // < 3 s new audio: no pause can qualify
+            self.chunkRunning = true; defer { self.chunkRunning = false }
+            let snap = workPath("sori_chunk.wav")
+            // Header of the live WAV is not finalized until close (see rebuildPartialWav).
+            guard Self.rebuildPartialWav(from: wav, to: snap) else { return }
+            session.snapshots += 1
+            guard let (text, committed) = QwenServer.segment(wav: snap, offsetMs: session.committedMs,
+                                                               lang: lang, vocabulary: vocabulary) else { return }
+            guard committed > session.committedMs else { return }
+            session.committedMs = committed
+            if !text.isEmpty {
+                session.text = session.text.isEmpty ? text : session.text + " " + text
+                wlog("chunk committed @\(committed)ms: \"\(text.prefix(60))\"")
+                if self.isRecording { self.panel.setPartial(session.text) }
+            }
+        }
+        t.resume()
+        chunkTimer = t
+    }
+    private func stopChunkTimer() { chunkTimer?.cancel(); chunkTimer = nil }
+
     // Whisper runs here, NEVER on the main thread. The event-tap callback runs on the
     // main run loop; blocking it for a multi-second transcription made macOS disable the
     // tap by timeout — which is why Right-⌘ and Enter randomly went dead after use.
@@ -2463,6 +2561,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func stopAndTranscribe() {
         isRecording = false; wlog(">>> stopAndTranscribe")
         stopPartialTimer()
+        stopChunkTimer()
+        let session = chunk
+        chunk = nil
         if cfg.sound { Sounds.play("stop") }
         DispatchQueue.main.async { self.setStatusIcon("waveform", tint: .systemBlue) }
         panel.setTranscribing()
@@ -2479,7 +2580,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             do { try FileManager.default.moveItem(atPath: url.path, toPath: unique) }
             catch { wlog("WAV move FAILED: \(error)") }
             self.transcribeQueue.async {
-                self.transcribe(url: URL(fileURLWithPath: unique), cfg: cfg, submit: submit)
+                // A chunk request may still be in flight on the serial chunk queue; wait for
+                // it so its commit lands before we decide where the tail starts.
+                if session != nil { self.chunkQueue.sync {} }
+                self.transcribe(url: URL(fileURLWithPath: unique), cfg: cfg, submit: submit, session: session)
                 try? FileManager.default.removeItem(atPath: unique)
             }
         }
@@ -2500,7 +2604,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // takes no style prompt and does its own language ID over 52 languages, so
     // the pre-pass, the ggml-base model, and that failure mode are all gone.
 
-    private func transcribe(url: URL, cfg: Config, submit: Bool) {
+    private func transcribe(url: URL, cfg: Config, submit: Bool, session: ChunkSession? = nil) {
             let repo = cfg.asrModel ?? QwenServer.defaultRepo
             // Clear the previous output FIRST: a stale out.txt would paste the
             // PREVIOUS session's transcript again.
@@ -2523,9 +2627,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             QwenServer.ensureRunning(modelPath: repo)
             var text = ""
-            if let t = QwenServer.transcribe(wav: url.path, lang: lang, vocabulary: vocabulary) {
-                text = t
-                wlog("transcribed via qwen (lang=\(lang.isEmpty ? "auto" : lang))")
+            let offsetMs = session?.committedMs ?? 0
+            if let t = QwenServer.transcribe(wav: url.path, lang: lang, vocabulary: vocabulary, offsetMs: offsetMs) {
+                if let s = session, !s.text.isEmpty {
+                    text = t.isEmpty ? s.text : s.text + " " + t
+                    wlog("transcribed via qwen (chunked: \(s.snapshots) snapshots, committed \(s.committedMs)ms, tail \(t.count) chars)")
+                } else {
+                    text = t
+                    wlog("transcribed via qwen (lang=\(lang.isEmpty ? "auto" : lang))")
+                }
             } else {
                 // No silent degradation: there is no second engine by design, so a
                 // dead engine has to be visible rather than paste nothing and look
