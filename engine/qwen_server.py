@@ -97,83 +97,6 @@ def speech_ms(path):
         return None
 
 
-def _read_pcm(path):
-    """int16 samples of a 16 kHz mono WAV, or None when the file is not in that format."""
-    import wave
-    import numpy as np
-    with wave.open(path) as w:
-        if w.getframerate() != 16000 or w.getnchannels() != 1 or w.getsampwidth() != 2:
-            return None
-        return np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
-
-
-def _write_pcm(path, a):
-    import wave
-    with wave.open(path, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(16000)
-        w.writeframes(a.tobytes())
-
-
-def _slice_wav(path, offset_ms, end_ms=None):
-    """Write samples [offset_ms, end_ms) of `path` to a sibling temp WAV and return its
-    path, or None when the format is wrong. Sibling so --allow-dir still covers it."""
-    a = _read_pcm(path)
-    if a is None:
-        return None
-    lo = max(0, offset_ms * 16)
-    hi = len(a) if end_ms is None else min(len(a), end_ms * 16)
-    out = os.path.join(os.path.dirname(path), f".seg_{os.getpid()}_{threading.get_ident()}.wav")
-    _write_pcm(out, a[lo:hi])
-    return out
-
-
-def find_commit_point(path, offset_ms, min_new_ms, tail_ms):
-    """Chunked dictation: look at the audio after `offset_ms` and pick a cut inside the
-    LAST pause of at least `tail_ms` of VAD silence. Cutting only inside real silence is
-    what keeps a chunk boundary from splitting a word. Returns (cut_ms, speech_ms) or
-    None when there is no such pause yet, or the committed span would be shorter than
-    `min_new_ms` (a floor so the engine is not called every second for one word)."""
-    if _vad is None:
-        return None
-    a = _read_pcm(path)
-    if a is None:
-        return None
-    a = a[offset_ms * 16:]
-    hop = 256                                   # 16 ms per VAD frame
-    tail_frames = max(1, tail_ms // 16)
-    probs = []
-    for i in range(0, len(a) - hop + 1, hop):
-        prob, _flag = _vad.process(a[i:i + hop])
-        probs.append(prob > 0.5)
-    # Last silence run of >= tail_frames. Walk backwards so the newest pause wins.
-    run_end = None
-    best = None
-    i = len(probs) - 1
-    while i >= 0:
-        if not probs[i]:
-            if run_end is None:
-                run_end = i
-        else:
-            if run_end is not None and run_end - i >= tail_frames:
-                best = (i + 1, run_end)         # silence frames [i+1, run_end]
-                break
-            run_end = None
-        i -= 1
-    if best is None and run_end is not None and run_end + 1 >= tail_frames:
-        best = (0, run_end)                     # everything after offset is silence
-    if best is None:
-        return None
-    s, e = best
-    cut_frame = s + min(tail_frames // 2, (e - s) // 2)   # a little into the pause
-    cut_ms = cut_frame * hop * 1000 // 16000
-    if cut_ms < min_new_ms:
-        return None
-    speech = sum(1 for p in probs[:cut_frame] if p) * hop * 1000 // 16000
-    return cut_ms, speech
-
-
 def generate_with_timeout(path, kwargs):
     """Run the (non-reentrant) generate under the lock on a worker thread. If it does not
     return within _gen_timeout the process EXITS: the lock would otherwise stay held and
@@ -221,8 +144,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(503, {"status": "loading", "error": _model_err})
 
     def do_POST(self):
-        route = self.path.rstrip("/")
-        if route not in ("/inference", "/segment"):
+        if self.path.rstrip("/") != "/inference":
             self._send(404, {"error": "not found"})
             return
         if _model is None:
@@ -245,38 +167,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(403, {"error": f"path outside the allowed dir: {path}"})
             return
 
-        # Chunked dictation (Sori's chunkedTranscribe). /segment: commit everything after
-        # `offset_ms` up to the last real pause; /inference with offset_ms: the tail that
-        # was left uncommitted when the key came up. Both transcribe a sliced temp WAV so
-        # each second of audio goes through the model exactly once.
-        offset_ms = int(req.get("offset_ms") or 0)
-        end_ms = None
-        commit_ms = None
-        if route == "/segment":
-            cp = find_commit_point(path, offset_ms, int(req.get("min_new_ms") or 3000),
-                                   int(req.get("tail_ms") or 450))
-            if cp is None:
-                self._send(200, {"text": "", "committed_ms": offset_ms})
-                return
-            cut_ms, seg_speech = cp
-            end_ms = offset_ms + cut_ms
-            commit_ms = end_ms
-            if seg_speech < _vad_min_ms:
-                log(f"segment {offset_ms}-{end_ms}ms: {seg_speech}ms speech -> skipped")
-                self._send(200, {"text": "", "committed_ms": commit_ms, "speech_ms": seg_speech})
-                return
-        seg = None
-        if offset_ms > 0 or end_ms is not None:
-            seg = _slice_wav(path, offset_ms, end_ms)
-            if seg is None:
-                self._send(400, {"error": "offset slicing needs a 16 kHz mono int16 WAV"})
-                return
-            path = seg
-
         ms = speech_ms(path)
         if ms is not None and ms < _vad_min_ms:
-            if seg:
-                os.unlink(seg)
             log(f"vad: {ms}ms speech < {_vad_min_ms}ms -> skipped inference")
             self._send(200, {"text": "", "speech_ms": ms})
             return
@@ -310,12 +202,8 @@ class Handler(BaseHTTPRequestHandler):
                 kwargs.pop("system_prompt", None)
                 text = generate_with_timeout(path, kwargs)
             vad_note = f", vad {ms}ms" if ms is not None else ""
-            seg_note = f" [{route[1:]} {offset_ms}-{end_ms if end_ms is not None else 'end'}ms]" if seg else ""
-            log(f"inference {time.time() - t0:.2f}s -> {len(text)} chars{vad_note}{seg_note}")
-            out = {"text": text, "speech_ms": ms}
-            if commit_ms is not None:
-                out["committed_ms"] = commit_ms
-            self._send(200, out)
+            log(f"inference {time.time() - t0:.2f}s -> {len(text)} chars{vad_note}")
+            self._send(200, {"text": text, "speech_ms": ms})
         except TimeoutError as e:
             log(f"inference TIMEOUT: {e} -- exiting so Sori respawns the engine")
             self._send(500, {"error": f"TimeoutError: {e}"})
@@ -327,12 +215,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:                               # noqa: BLE001
             log(f"inference FAILED: {type(e).__name__}: {e}")
             self._send(500, {"error": f"{type(e).__name__}: {e}"})
-        finally:
-            if seg:
-                try:
-                    os.unlink(seg)
-                except OSError:
-                    pass
 
 
 def main():
