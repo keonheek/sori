@@ -63,6 +63,8 @@ From a terminal, without the menu:
 
 Settings live in the menu-bar menu and in `~/.sori.conf` (JSON): model (a Qwen3-ASR MLX repo id), language (`auto` recommended — the engine identifies language itself across 52 languages), vocabulary hints, warm engine, cleanup toggles. The vocabulary bias is capped at 12 terms and names are sent first; see the design note below on why the cap matters. For the optional AI cleanup, put a [free Groq API key](https://console.groq.com) in `~/.sori-groq` and enable "AI Cleanup" in the menu.
 
+**AirPods / Bluetooth headsets.** If the system default input is a Bluetooth device, Sori captures from the Mac's built-in microphone instead. Opening a Bluetooth mic switches the earbuds from the music profile (A2DP) to the call profile (HFP), which pauses playback and adds about a second of silence on every press and release. Set `"avoidBluetoothMic": false` in `~/.sori.conf` to dictate through the earbuds' mic anyway.
+
 ## Diagnostics
 
 The log is `~/Library/Logs/Sori/sori.log` (rotated at 2 MB into `sori.log.1`). Every dictation writes its raw and final text there, plus the engine's inference time and how much speech the voice-activity gate found. If Right ⌘ ever goes dead, that file says why: a disabled event tap, secure input left on by the lock screen, a missing venv, or an engine that had to be respawned.
