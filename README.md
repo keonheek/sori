@@ -63,6 +63,10 @@ From a terminal, without the menu:
 
 Settings live in the menu-bar menu and in `~/.sori.conf` (JSON): model (a Qwen3-ASR MLX repo id), language (`auto` recommended — the engine identifies language itself across 52 languages), vocabulary hints, warm engine, cleanup toggles. The vocabulary bias is capped at 12 terms and names are sent first; see the design note below on why the cap matters. For the optional AI cleanup, put a [free Groq API key](https://console.groq.com) in `~/.sori-groq` and enable "AI Cleanup" in the menu.
 
+**Cloud transcriber (optional).** Set `"asrProvider": "openai"` in `~/.sori.conf` and put an OpenAI API key in `~/.sori-openai` to transcribe with `gpt-transcribe` ($0.0045 per audio minute) instead of the local Qwen3-ASR engine. On a Korean-English read-aloud test it cut the character error rate from 13.4% (local) to 3.1%. The local engine still runs the silence gate, and Sori falls back to it whenever the API call fails. `"asrCloudModel"` overrides the model id.
+
+**Smart Rewrite.** Menu toggle (`"smartRewrite": true`). Reads the frontmost app and window title when you stop recording and rewrites the transcript the way you would have typed it there: chat apps stay casual, mail and documents get full sentences, editors and terminals keep every command and identifier verbatim, AI-assistant windows keep the text as your instruction. Uses the Groq key. A guard rejects any output that translates, answers, or drops content, and the raw transcript pastes instead.
+
 **AirPods / Bluetooth headsets.** If the system default input is a Bluetooth device, Sori captures from the Mac's built-in microphone instead. Opening a Bluetooth mic switches the earbuds from the music profile (A2DP) to the call profile (HFP), which pauses playback and adds about a second of silence on every press and release. Set `"avoidBluetoothMic": false` in `~/.sori.conf` to dictate through the earbuds' mic anyway.
 
 ## Diagnostics

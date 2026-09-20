@@ -30,11 +30,37 @@ def gemini(p):
     body = {"contents": [{"parts": [{"inlineData": {"mimeType": "audio/wav", "data": b64}}, {"text": "Transcribe this audio exactly as spoken. Korean and English may be mixed; keep each language as spoken. Output only the transcript."}]}]}
     r, dt, err = post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-transcribe:generateContent?key={os.environ['GEMINI_API_KEY']}", json.dumps(body).encode(), {"Content-Type": "application/json"})
     if err: return None, dt, err
-    try: return r["candidates"][0]["content"]["parts"][0]["text"].strip(), dt, None
+    try:
+        part = r["candidates"][0]["content"]["parts"][0]
+        return (part.get("text") or part["audioTranscription"]["text"]).strip(), dt, None
     except Exception: return None, dt, str(r)[:160]
+def rtzr(model, language):
+    def f(p):
+        cid, cs = os.environ["RTZR_CLIENT_ID"], os.environ["RTZR_CLIENT_SECRET"]
+        tok, _, err = post("https://openapi.vito.ai/v1/authenticate", f"client_id={cid}&client_secret={cs}".encode(), {"Content-Type": "application/x-www-form-urlencoded"})
+        if err: return None, 0, err
+        cfg = {"model_name": model, "language": language, "use_itn": True, "use_disfluency_filter": False,
+               "keywords": [k.strip() for k in HINT.split(",")]}
+        if language == "multi": cfg["language_candidates"] = ["ko", "en"]
+        body, h = multipart({"config": json.dumps(cfg)}, p)
+        t = time.time()
+        r, _, err = post("https://openapi.vito.ai/v1/transcribe", body, {**h, "Authorization": "Bearer " + tok["access_token"]})
+        if err: return None, 0, err
+        for _ in range(60):
+            time.sleep(1)
+            g, _, err = post_get(f"https://openapi.vito.ai/v1/transcribe/{r['id']}", {"Authorization": "Bearer " + tok["access_token"]})
+            if err: return None, time.time() - t, err
+            if g.get("status") == "completed": return " ".join(u["msg"] for u in g["results"]["utterances"]), time.time() - t, None
+            if g.get("status") == "failed": return None, time.time() - t, str(g)[:160]
+        return None, time.time() - t, "timeout"
+    return f
+def post_get(url, headers):
+    req = urllib.request.Request(url, headers={"User-Agent": "Sori-bench", **headers}); t = time.time()
+    try: return json.load(urllib.request.urlopen(req, timeout=60)), time.time() - t, None
+    except urllib.error.HTTPError as e: return None, time.time() - t, f"HTTP {e.code} {e.read().decode()[:160]}"
 def local(p):
     t = time.time(); return local_transcribe(8918, p, os.path.join(os.environ.get("TMPDIR", "/tmp"), "sori")), time.time() - t, None
-PROV = {"local": local, "groq-whisper-turbo": groq, "gemini-3.5-transcribe": gemini, "gpt-transcribe": openai("gpt-transcribe"), "gpt-4o-mini-transcribe": openai("gpt-4o-mini-transcribe")}
+PROV = {"local": local, "groq-whisper-turbo": groq, "gemini-3.5-transcribe": gemini, "gpt-transcribe": openai("gpt-transcribe"), "gpt-4o-mini-transcribe": openai("gpt-4o-mini-transcribe"), "rtzr-sommers-ko": rtzr("sommers", "ko"), "rtzr-whisper-multi": rtzr("whisper", "multi")}
 def main():
     man = sys.argv[1]; want = sys.argv[2].split(",") if len(sys.argv) > 2 else list(PROV)
     rows = [l.rstrip("\n").split("\t") for l in open(man, encoding="utf-8") if l.strip()]

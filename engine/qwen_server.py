@@ -10,7 +10,7 @@ path costs ~9s, almost all of it Python startup) is not an option.
 Contract (loopback only, no auth -- it is bound to 127.0.0.1):
 
     GET  /            -> 200 "ok" once the model is loaded, 503 while loading
-    POST /inference   -> {"path": "/abs/file.wav", "language": "ko"|null,
+    POST /inference   -> {"path": "/abs/file.wav", "language": "ko"|null, "vad_only": bool,
                           "context": "Groq, Pinecone, ..."}
                       -> {"text": "...", "speech_ms": N|null}
                          (text is "" when TEN-VAD found < --vad-min-ms of speech;
@@ -171,6 +171,11 @@ class Handler(BaseHTTPRequestHandler):
         if ms is not None and ms < _vad_min_ms:
             log(f"vad: {ms}ms speech < {_vad_min_ms}ms -> skipped inference")
             self._send(200, {"text": "", "speech_ms": ms})
+            return
+        if req.get("vad_only"):
+            # Gate for a cloud transcriber: Sori asks "is there speech?" here, then sends the
+            # clip elsewhere. Keeps the short-tap / silence guard without local inference.
+            self._send(200, {"text": None, "speech_ms": ms})
             return
 
         kwargs = {}

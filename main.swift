@@ -105,6 +105,12 @@ struct Config: Codable {
     // recording stops and adapts register: chat apps stay casual, mail/docs get full sentences,
     // code/terminal/AI-chat keep every technical token verbatim. His ask 2026-09-20.
     var smartRewrite: Bool? = nil
+    // Transcriber: "local" (Qwen3-ASR via qwen_server, default) or "openai" (gpt-transcribe over
+    // the API, key in ~/.sori-openai). Picked 2026-09-20 on his read-aloud clip: gpt-transcribe
+    // 3.1% CER vs local 13.4% / Groq whisper 7.1% / Gemini 3.5 10.6% / ReturnZero 17.1%.
+    // The local engine still runs the VAD gate (vad_only) and is the fallback when the API fails.
+    var asrProvider: String? = nil
+    var asrCloudModel: String? = nil     // default gpt-transcribe ($0.0045/min)
 
     // Style anchor appended to every whisper prompt. Whisper mimics the prompt's WRITING
     // STYLE — a punctuated prose prompt yields punctuated output; the old bare comma-list
@@ -767,6 +773,26 @@ enum QwenServer {
         return false
     }
 
+    // Speech gate only (TEN-VAD in the engine), no inference. nil = engine unavailable
+    // (caller decides), true = speech present, false = silence / short tap.
+    static func hasSpeech(wav: String) -> Bool? {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/inference"),
+              let body = try? JSONSerialization.data(withJSONObject: ["path": wav, "vad_only": true]) else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"; req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body; req.timeoutInterval = 3
+        let sem = DispatchSemaphore(value: 0); var result: Bool? = nil
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            defer { sem.signal() }
+            guard let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            if json["error"] != nil { return }
+            // Engine answers text:"" when VAD found too little speech, text:null when it passed.
+            result = !(json["text"] is String)
+        }.resume()
+        _ = sem.wait(timeout: .now() + 3.5)
+        return result
+    }
+
     static func transcribe(wav: String, lang: String, vocabulary: String = "") -> String? {
         guard let url = URL(string: "http://127.0.0.1:\(port)/inference") else { return nil }
         var payload: [String: String] = ["path": wav]
@@ -806,6 +832,50 @@ enum QwenServer {
             guard waitHealthy(limit: 15) else { return nil }
         }
         return nil
+    }
+}
+
+// MARK: - Cloud transcriber (OpenAI gpt-transcribe)
+enum OpenAITranscribe {
+    static func apiKey() -> String? {
+        if let env = ProcessInfo.processInfo.environment["OPENAI_API_KEY"], !env.isEmpty { return env }
+        let p = (NSHomeDirectory() as NSString).appendingPathComponent(".sori-openai")
+        return (try? String(contentsOfFile: p, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    // Multipart upload of the 16 kHz mono WAV. `prompt` carries names + vocabulary (the API's
+    // documented use: "domain terms and multilingual audio"). Returns nil on any failure so the
+    // caller can fall back to the local engine; never returns a partial/garbled body.
+    static func transcribe(wav: String, model: String, prompt: String, timeout: TimeInterval = 8) -> String? {
+        guard let key = apiKey(), !key.isEmpty else { wlog("openai transcribe: no key (~/.sori-openai)"); return nil }
+        guard let audio = FileManager.default.contents(atPath: wav),
+              let url = URL(string: "https://api.openai.com/v1/audio/transcriptions") else { return nil }
+        let b = "sori\(UUID().uuidString)"
+        var body = Data()
+        func field(_ n: String, _ v: String) { body.append("--\(b)\r\nContent-Disposition: form-data; name=\"\(n)\"\r\n\r\n\(v)\r\n".data(using: .utf8)!) }
+        field("model", model); field("response_format", "json")
+        if !prompt.isEmpty { field("prompt", prompt) }
+        body.append("--\(b)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sori.wav\"\r\nContent-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
+        body.append(audio); body.append("\r\n--\(b)--\r\n".data(using: .utf8)!)
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("multipart/form-data; boundary=\(b)", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        req.httpBody = body
+        req.timeoutInterval = timeout
+        let sem = DispatchSemaphore(value: 0)
+        var out: String? = nil
+        let t0 = Date()
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            defer { sem.signal() }
+            if let err = err { wlog("openai transcribe error: \(err.localizedDescription)"); return }
+            guard let data = data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            if let e = json["error"] as? [String: Any] { wlog("openai transcribe API error: \(e["message"] as? String ?? "?")"); return }
+            if let t = json["text"] as? String { out = t.trimmingCharacters(in: .whitespacesAndNewlines) }
+            _ = resp
+        }.resume()
+        _ = sem.wait(timeout: .now() + timeout + 1)
+        if out != nil { wlog(String(format: "openai transcribe %@ %.2fs", model, Date().timeIntervalSince(t0))) }
+        return out
     }
 }
 
@@ -2956,7 +3026,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             QwenServer.ensureRunning(modelPath: repo)
             var text = ""
-            if let t = QwenServer.transcribe(wav: url.path, lang: lang, vocabulary: vocabulary) {
+            var cloudText: String? = nil
+            if (cfg.asrProvider ?? "local") == "openai" {
+                // Local VAD gate first (silence / short tap → no upload, no cost, no hallucination).
+                let gate = QwenServer.hasSpeech(wav: url.path)
+                if gate == false {
+                    cloudText = ""
+                    wlog("vad gate: no speech — cloud transcribe skipped")
+                } else {
+                    let hint = [cfg.promptHint, vocabulary].filter { !$0.isEmpty }.joined(separator: ", ")
+                    cloudText = OpenAITranscribe.transcribe(wav: url.path, model: cfg.asrCloudModel ?? "gpt-transcribe", prompt: hint)
+                    if cloudText == nil { wlog("openai transcribe FAILED — falling back to local qwen") }
+                }
+            }
+            if let c = cloudText {
+                text = c
+                wlog("transcribed via openai")
+            } else if let t = QwenServer.transcribe(wav: url.path, lang: lang, vocabulary: vocabulary) {
                 text = t
                 wlog("transcribed via qwen (lang=\(lang.isEmpty ? "auto" : lang))")
             } else {
