@@ -12,6 +12,12 @@ if CommandLine.arguments.contains("--check-update") { Updater.runCLICheck() }
 if let i = CommandLine.arguments.firstIndex(of: "--import-log"), i + 1 < CommandLine.arguments.count {
     let n = LogImport.run(path: CommandLine.arguments[i + 1]); print("imported \(n) dictations"); exit(0)
 }
+// Text-pass check without audio: dictionary corrections + snippet expansion on a given string.
+if let i = CommandLine.arguments.firstIndex(of: "--text-pass"), i + 1 < CommandLine.arguments.count {
+    var t = DictionaryRepo.apply(CommandLine.arguments[i + 1])
+    if let (e, trig) = SnippetRepo.expand(t) { t = e; print("snippet: \(trig)") }
+    print(t); exit(0)
+}
 // Headless Hub render for review: never orders a window front, no dock icon, exits when written.
 if let i = CommandLine.arguments.firstIndex(of: "--hub-snapshot"), i + 1 < CommandLine.arguments.count {
     let snapApp = NSApplication.shared

@@ -12,13 +12,11 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
     // controls
     private var modelPopup: NSPopUpButton!
     private var langPopup: NSPopUpButton!
-    private var hintField: NSTextField!
     private var soundCheck: NSButton!
     private var loginCheck: NSButton!
     private var aiTermsCheck: NSButton!
     private var pressEnterCheck: NSButton!
     private var panelStyleSegment: NSSegmentedControl!
-    private var replTable: NSTableView!
 
     // layout
     private let sidebarW: CGFloat = 168
@@ -49,8 +47,6 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
         cfg = Config.load()
         // Show auto-learned corrections in the same table so they can be reviewed,
         // edited, or deleted. saveTapped() writes the merged list back to `replacements`.
-        cfg.replacements += cfg.learnedReplacements ?? []
-        cfg.learnedReplacements = []
         guard let cv = window?.contentView else { return }
         cv.subviews.forEach { $0.removeFromSuperview() }
         cv.wantsLayer = true
@@ -193,39 +189,22 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
         let H = p.bounds.height
         sectionHeader("Vocabulary", p, H - 56)
 
-        fieldLabel("Names & custom words (helps spell them right)", p, H - 96)
-        hintField = NSTextField(frame: NSRect(x: 28, y: H - 124, width: p.bounds.width - 56, height: 26))
-        hintField.stringValue = cfg.promptHint
-        hintField.placeholderString = "your name, teammates, product names"
-        p.addSubview(hintField)
-
         aiTermsCheck = NSButton(checkboxWithTitle: "  Recognize modern AI / dev terminology (ChatGPT, RAG, LangGraph…)",
                                 target: nil, action: nil)
-        aiTermsCheck.frame = NSRect(x: 28, y: H - 158, width: p.bounds.width - 56, height: 22)
+        aiTermsCheck.frame = NSRect(x: 28, y: H - 100, width: p.bounds.width - 56, height: 22)
         aiTermsCheck.state = (cfg.aiTermsEnabled ?? true) ? .on : .off
         p.addSubview(aiTermsCheck)
 
-        fieldLabel("Auto-corrections  (heard → replace with)", p, H - 196)
-        let scroll = NSScrollView(frame: NSRect(x: 28, y: 64, width: p.bounds.width - 56, height: H - 270))
-        scroll.autoresizingMask = [.width, .height]
-        scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
-        scroll.wantsLayer = true; scroll.layer?.cornerRadius = 8
-        replTable = NSTableView(frame: scroll.bounds)
-        let c1 = NSTableColumn(identifier: .init("from")); c1.title = "Heard"; c1.width = 230
-        let c2 = NSTableColumn(identifier: .init("to")); c2.title = "Replace with"; c2.width = 230
-        replTable.addTableColumn(c1); replTable.addTableColumn(c2)
-        replTable.dataSource = self; replTable.delegate = self
-        replTable.usesAlternatingRowBackgroundColors = true
-        replTable.rowHeight = 24
-        scroll.documentView = replTable; p.addSubview(scroll)
-
-        let addBtn = NSButton(title: "+", target: self, action: #selector(addRow))
-        addBtn.frame = NSRect(x: 28, y: 22, width: 36, height: 30); addBtn.bezelStyle = .rounded
-        p.addSubview(addBtn)
-        let delBtn = NSButton(title: "–", target: self, action: #selector(delRow))
-        delBtn.frame = NSRect(x: 70, y: 22, width: 36, height: 30); delBtn.bezelStyle = .rounded
-        p.addSubview(delBtn)
+        // Names, spellings and corrections moved to the Hub's Dictionary (store-backed) 2026-09-20.
+        fieldLabel("Names, spellings and corrections live in Sori Hub → Dictionary.", p, H - 150)
+        let hubBtn = NSButton(title: "Open Dictionary…", target: self, action: #selector(openDictionary))
+        hubBtn.frame = NSRect(x: 28, y: H - 190, width: 160, height: 30); hubBtn.bezelStyle = .rounded
+        p.addSubview(hubBtn)
         return p
+    }
+
+    @objc private func openDictionary() {
+        (NSApp.delegate as? AppDelegate)?.openHub(section: .dictionary)
     }
 
     // MARK: Sounds pane
@@ -282,13 +261,6 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
     @objc private func previewStart() { Sounds.play("start") }
     @objc private func previewStop() { Sounds.play("stop") }
 
-    // MARK: table edit
-    @objc private func addRow() { cfg.replacements.append(Replacement(from: "", to: "")); replTable.reloadData() }
-    @objc private func delRow() {
-        let r = replTable.selectedRow
-        if r >= 0 && r < cfg.replacements.count { cfg.replacements.remove(at: r); replTable.reloadData() }
-    }
-
     @objc private func saveTapped() {
         // COMMIT any in-progress table-cell edit first. Without this, the value still
         // sitting in the field editor is lost — clicking Save (or pressing Enter, which
@@ -296,20 +268,12 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
         window?.makeFirstResponder(nil)
         cfg.asrModel = modelPopup.titleOfSelectedItem ?? cfg.asrModel
         cfg.lang = langPopup.titleOfSelectedItem ?? cfg.lang
-        cfg.promptHint = hintField.stringValue
         cfg.sound = soundCheck.state == .on
         cfg.aiTermsEnabled = aiTermsCheck.state == .on
         cfg.pressEnter = pressEnterCheck.state == .on
         cfg.panelStyle = panelStyleSegment.selectedSegment == 1 ? "compact" : "classic"
-        // Drop rows with an empty "heard" side (they can never match anything).
-        cfg.replacements = cfg.replacements.filter {
-            !$0.from.trimmingCharacters(in: .whitespaces).isEmpty
-        }
-        // The table shows manual + learned rules merged (see buildShell); everything the
-        // user saw and edited is now canonical in `replacements`.
-        cfg.learnedReplacements = []
         cfg.save()
-        wlog("settings saved: \(cfg.replacements.count) corrections, model=\(cfg.asrModel ?? QwenServer.defaultRepo), pressEnter=\(cfg.pressEnter ?? false), panelStyle=\(cfg.panelStyle ?? "classic")")
+        wlog("settings saved: model=\(cfg.asrModel ?? QwenServer.defaultRepo), pressEnter=\(cfg.pressEnter ?? false), panelStyle=\(cfg.panelStyle ?? "classic")")
         LoginItem.set(enabled: loginCheck.state == .on)
         onSave?(cfg)
         window?.close()
@@ -318,32 +282,4 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
     func reloadFromDisk() { buildShell(); select("General") }
 }
 
-extension SettingsController: NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
-    func numberOfRows(in t: NSTableView) -> Int { cfg.replacements.count }
-    func tableView(_ t: NSTableView, viewFor col: NSTableColumn?, row: Int) -> NSView? {
-        let id = NSUserInterfaceItemIdentifier("cell")
-        let tf = (t.makeView(withIdentifier: id, owner: self) as? NSTextField) ?? {
-            let f = NSTextField(); f.identifier = id; f.isBordered = false; f.drawsBackground = false
-            f.isEditable = true; f.target = self; f.action = #selector(cellEdited(_:))
-            f.delegate = self   // commit on END of editing too (click away / Save / close)
-            return f
-        }()
-        let isFrom = col?.identifier.rawValue == "from"
-        tf.stringValue = isFrom ? cfg.replacements[row].from : cfg.replacements[row].to
-        tf.tag = row * 2 + (isFrom ? 0 : 1)
-        return tf
-    }
-    @objc private func cellEdited(_ sender: NSTextField) {
-        let row = sender.tag / 2, isFrom = sender.tag % 2 == 0
-        guard row < cfg.replacements.count else { return }
-        if isFrom { cfg.replacements[row].from = sender.stringValue }
-        else { cfg.replacements[row].to = sender.stringValue }
-    }
-    // Fires when a cell loses focus for ANY reason (tab, click elsewhere, Save's
-    // makeFirstResponder(nil), window close) — the action alone only fired on Enter.
-    func controlTextDidEndEditing(_ obj: Notification) {
-        if let tf = obj.object as? NSTextField, tf.identifier?.rawValue == "cell" {
-            cellEdited(tf)
-        }
-    }
-}
+extension SettingsController: NSTextFieldDelegate {}

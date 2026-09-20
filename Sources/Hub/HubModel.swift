@@ -5,14 +5,21 @@ import Combine
 final class HubModel: ObservableObject {
     enum Section: String, CaseIterable, Identifiable {
         case home = "Home"
+        case dictionary = "Dictionary"
+        case snippets = "Snippets"
         var id: String { rawValue }
-        var symbol: String { switch self { case .home: return "house" } }
+        var symbol: String {
+            switch self { case .home: return "house"; case .dictionary: return "character.book.closed"; case .snippets: return "text.insert" }
+        }
     }
 
     @Published var section: Section = .home
     @Published var query: String = "" { didSet { reloadRows() } }
     @Published var rows: [Dictation] = []
     @Published var stats = DictationStats()
+    @Published var dictionary: [DictionaryEntry] = []
+    @Published var dictQuery: String = ""
+    @Published var snippets: [Snippet] = []
 
     private var subs: [AnyCancellable] = []
 
@@ -21,12 +28,22 @@ final class HubModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.reload() }
             .store(in: &subs)
+        NotificationCenter.default.publisher(for: Database.dictionaryChanged)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.dictionary = DictionaryRepo.all() }
+            .store(in: &subs)
+        NotificationCenter.default.publisher(for: Database.snippetsChanged)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.snippets = SnippetRepo.all() }
+            .store(in: &subs)
         reload()
     }
 
     func reload() {
         stats = DictationRepo.stats()
         reloadRows()
+        dictionary = DictionaryRepo.all()
+        snippets = SnippetRepo.all()
     }
 
     func reloadRows() {

@@ -17,6 +17,8 @@ struct HubRootView: View {
         } detail: {
             switch model.section {
             case .home: HomeView(model: model)
+            case .dictionary: DictionaryView(model: model)
+            case .snippets: SnippetsView(model: model)
             }
         }
         .frame(minWidth: 760, minHeight: 480)

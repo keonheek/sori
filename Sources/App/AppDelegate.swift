@@ -58,6 +58,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             exit(0)
         }
         // lockFd is intentionally never closed — the lock must live exactly as long as the process.
+        DictionaryRepo.migrateFromConfigIfNeeded()
+        cfg = Config.load()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         setStatusIcon("mic")
         statusItem.menu = buildMainMenu()
@@ -158,7 +160,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Tap Right ⌘ to start / stop", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Open Sori Hub", action: #selector(openHub), keyEquivalent: "h"))
+        menu.addItem(NSMenuItem(title: "Open Sori Hub", action: #selector(openHubAction), keyEquivalent: "h"))
         let lastItem = NSMenuItem(title: "Paste Last Transcript", action: #selector(pasteLastTranscript), keyEquivalent: "")
         lastItem.isEnabled = DictationRepo.last() != nil
         menu.addItem(lastItem)
@@ -296,10 +298,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wlog("microphone pick -> \(uid.isEmpty ? "system default" : sender.title)")
     }
 
-    @objc func openHub() {
+    @objc func openHubAction() { openHub(section: .home) }
+    func openHub(section: HubModel.Section) {
         if hub == nil { hub = HubController() }
+        hub?.model.section = section
         hub?.show()
-        wlog("hub opened")
+        wlog("hub opened (\(section.rawValue))")
     }
 
     // From the menu bar / indicator menu: the target app keeps focus (the status menu and the
@@ -688,7 +692,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Vocabulary bias, capped at Config.maxBiasTerms. The Settings "Names &
             // custom words" field and the AI-terminology checkbox both feed this — they
             // were dead between the engine swap and 2026-08-12 (he spotted it in the UI).
-            let vocabulary = cfg.biasPrompt
+            let vocabulary = DictionaryRepo.biasPrompt(cfg: cfg)
 
             QwenServer.ensureRunning(modelPath: repo)
             var text = ""
@@ -795,7 +799,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             text = text.replacingOccurrences(of: "\n", with: " ")
                        .replacingOccurrences(of: " {2,}", with: " ", options: .regularExpression)
             text = TextCleanup.collapseRepetitionLoop(text)
-            text = cfg.applyReplacements(text)
+            text = DictionaryRepo.apply(text)
             // Wispr-Flow-style cleanup (rule-based): strip fillers, fix disfluencies, tidy.
             if cfg.cleanupEnabled ?? true { text = TextCleanup.clean(text) }
             // Optional Tier 2 LLM rewrite for grammar/redundancy. Skipped for short
@@ -814,6 +818,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if cfg.cleanupEnabled ?? true { text = TextCleanup.clean(text) }
             }
             rewriteMs = Int(Date().timeIntervalSince(tRewrite) * 1000)
+            // Snippets: a dictation that opens with a trigger phrase becomes its expansion.
+            if let (expanded, trig) = SnippetRepo.expand(text) {
+                wlog("snippet \"\(trig)\" expanded (\(expanded.count) chars)")
+                text = expanded
+            }
             wlog("raw=\"\(raw)\" -> final=\"\(text)\"")
             // Every dictation that produced text is a row, pasted or not — Home, stats, undo and
             // the eval set all read this one table.
@@ -926,18 +935,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard f.split(separator: " ").count <= 3, t.split(separator: " ").count <= 3 else { return }
         // Learn on the FIRST confident correction. Requiring the same edit twice within
         // a 6s clipboard window meant it effectively never learned anything.
-        var c = Config.load()
-        var learned = c.learnedReplacements ?? []
-        let manual = c.replacements
-        if manual.contains(where: { $0.from.lowercased() == f.lowercased() }) { return }
-        if let idx = learned.firstIndex(where: { $0.from.lowercased() == f.lowercased() }) {
-            learned[idx].to = t   // user corrected the correction — update it
-        } else {
-            learned.append(Replacement(from: f, to: t))
-        }
-        c.learnedReplacements = learned
-        c.save()
-        self.cfg = c
+        DictionaryRepo.upsertLearned(from: f, to: t)
         wlog("LEARNED correction \"\(f)\" -> \"\(t)\" (auto-applied going forward)")
     }
 }
