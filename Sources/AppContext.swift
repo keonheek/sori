@@ -10,6 +10,7 @@ struct AppContext {
     let bundleId: String
     let appName: String
     let windowTitle: String
+    var fieldText: String = ""     // text already in the focused field before the caret (context awareness)
     var summary: String { "\(appName) [\(bundleId)]" + (windowTitle.isEmpty ? "" : " — \(windowTitle)") }
 
     static func capture() -> AppContext {
@@ -25,7 +26,29 @@ struct AppContext {
                 title = (t as? String) ?? ""
             }
         }
-        return AppContext(bundleId: app.bundleIdentifier ?? "", appName: app.localizedName ?? "", windowTitle: title)
+        var ctx = AppContext(bundleId: app.bundleIdentifier ?? "", appName: app.localizedName ?? "", windowTitle: title)
+        if Config.load().contextAwareness ?? true { ctx.fieldText = focusedFieldTextBeforeCaret(cap: 1500) }
+        return ctx
+    }
+
+    // What is already typed in the field, up to the caret (Wispr's "context awareness"). Data for
+    // register and continuation only — the rewrite prompt is told never to repeat or rewrite it.
+    static func focusedFieldTextBeforeCaret(cap: Int) -> String {
+        let sys = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success, let f = focusedRef else { return "" }
+        let el = f as! AXUIElement
+        var valRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXValueAttribute as CFString, &valRef) == .success, let value = valRef as? String, !value.isEmpty else { return "" }
+        var end = value.utf16.count
+        var rangeRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success, let rv = rangeRef {
+            var r = CFRange()
+            if AXValueGetValue(rv as! AXValue, .cfRange, &r), r.location >= 0, r.location <= end { end = r.location }
+        }
+        let u = Array(value.utf16.prefix(end))
+        let tail = u.suffix(cap)
+        return String(utf16CodeUnits: Array(tail), count: tail.count).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     enum Kind: String { case chat, mail, docs, code, aiChat, general }

@@ -49,10 +49,11 @@ struct SettingsView: View {
                 }
                 .labelsHidden().frame(width: 140)
             }
-            SettingRow(label: "Transcriber", detail: "OpenAI gpt-transcribe: 3.1% CER on your read-aloud clip, $0.0045 per minute. Local Qwen3-ASR runs offline and is the fallback either way.") {
-                Picker("", selection: model.binding(\.asrProvider, default: "local")) {
-                    Text("OpenAI gpt-transcribe").tag("openai")
-                    Text("Local Qwen3-ASR").tag("local")
+            SettingRow(label: "Transcriber", detail: "Accurate: gpt-transcribe, 3.1% CER on your read-aloud clip, text ~1.2 s after release when streaming. Fastest: gpt-live-transcribe, ~0.5 s but 6.9% CER on the same clip. Local runs offline and is the fallback either way.") {
+                Picker("", selection: Binding(get: { model.transcriberChoice }, set: { model.setTranscriber($0) })) {
+                    Text("OpenAI, accurate").tag("openai:gpt-transcribe")
+                    Text("OpenAI, fastest").tag("openai:gpt-live-transcribe")
+                    Text("Local Qwen3-ASR").tag("local:")
                 }
                 .labelsHidden().frame(width: 220)
             }
@@ -98,7 +99,7 @@ struct SettingsView: View {
             SettingRow(label: "Command Mode", detail: "Hold Right ⌘ + Right ⌥, say what to do with the selected text (\"make this shorter\"), release.") {
                 Toggle("", isOn: model.binding(\.commandMode, default: false)).labelsHidden().toggleStyle(.switch)
             }
-            SettingRow(label: "Streaming recognition", detail: "Transcribe while you talk so the text lands faster on release. OpenAI only.") {
+            SettingRow(label: "Streaming recognition", detail: "Transcribe while you talk so only the tail is pending on release. OpenAI only; the upload path is the fallback.") {
                 Toggle("", isOn: model.binding(\.streamingASR, default: false)).labelsHidden().toggleStyle(.switch)
             }
         }
@@ -109,6 +110,9 @@ struct SettingsView: View {
             SettingRow(label: "Use the cloud transcriber", detail: "Off sends nothing anywhere: local recognition, rule-based cleanup only.") {
                 Toggle("", isOn: Binding(get: { (model.cfg.asrProvider ?? "local") == "openai" },
                                          set: { model.set(\.asrProvider, $0 ? "openai" : "local") })).labelsHidden().toggleStyle(.switch)
+            }
+            SettingRow(label: "Use on-screen text as context", detail: "Sends the text already in the field (before the cursor, up to 1,500 characters) with the rewrite so it matches language and continues your sentence. Off keeps only the app name.") {
+                Toggle("", isOn: model.binding(\.contextAwareness, default: true)).labelsHidden().toggleStyle(.switch)
             }
             SettingRow(label: "Keep recordings", detail: "Saves each dictation's audio under ~/Dev/sori/tests/eval/personal/raw. Off by default.") {
                 Toggle("", isOn: Binding(get: { !(model.cfg.keepRecordingsDir ?? "").isEmpty },

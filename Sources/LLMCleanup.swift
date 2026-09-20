@@ -39,7 +39,8 @@ You are a text-transformation FUNCTION, not an assistant. The user message is a 
 - If the transcript is already clean, return it unchanged.
 \(style)
 \(tone.promptClause)
-Output ONLY the rewritten text, on one line, with no quotes, no tags, no explanation.
+\(context.fieldText.isEmpty ? "" : "The user message may include <before> tags: text that is ALREADY in the field before the cursor. Use it only to match language, register, and continuation (e.g. continue a sentence the speaker started typing). Never repeat, rewrite, or answer it; output only the rewritten transcript.")
+Output ONLY the rewritten text, keeping any line breaks the transcript has, with no quotes, no tags, no explanation.
 
 Examples (input => output):
 "um so can you, can you open notion and like add a page" => "So can you open Notion and add a page?"
@@ -58,7 +59,7 @@ Examples (input => output):
             "temperature": 0,
             "messages": [
                 ["role": "system", "content": system],
-                ["role": "user", "content": "<transcript>\n\(text)\n</transcript>"],
+                ["role": "user", "content": (context.fieldText.isEmpty ? "" : "<before>\n\(context.fieldText)\n</before>\n") + "<transcript>\n\(text)\n</transcript>"],
             ],
         ]
         guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return nil }

@@ -48,6 +48,18 @@ final class HubModel: ObservableObject {
         cfg = fresh
         NotificationCenter.default.post(name: HubModel.configChanged, object: nil)
     }
+    var transcriberChoice: String {
+        let prov = cfg.asrProvider ?? "local"
+        return prov == "openai" ? "openai:\(cfg.asrCloudModel ?? "gpt-transcribe")" : "local:"
+    }
+    func setTranscriber(_ choice: String) {
+        let parts = choice.split(separator: ":", maxSplits: 1).map(String.init)
+        var fresh = Config.load()
+        fresh.asrProvider = parts[0]
+        if parts.count > 1, !parts[1].isEmpty { fresh.asrCloudModel = parts[1] }
+        fresh.save(); cfg = fresh
+        NotificationCenter.default.post(name: HubModel.configChanged, object: nil)
+    }
     func setLoginItem(_ on: Bool) { LoginItem.set(enabled: on); loginItem = LoginItem.isEnabled() }
     func clearHistory() { Database.shared.run("DELETE FROM dictations"); wlog("history cleared by user"); reload() }
 

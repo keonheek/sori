@@ -16,6 +16,11 @@ if let i = CommandLine.arguments.firstIndex(of: "--import-log"), i + 1 < Command
 if let i = CommandLine.arguments.firstIndex(of: "--text-pass"), i + 1 < CommandLine.arguments.count {
     var t = DictionaryRepo.apply(CommandLine.arguments[i + 1])
     if let (e, trig) = SnippetRepo.expand(t) { t = e; print("snippet: \(trig)") }
+    if Formatting.hasCommands(t) {
+        let pieces = Formatting.parse(t)
+        t = Formatting.join(pieces.map { p in if case .text(let x) = p { return .text(TextCleanup.clean(x)) }; return p })
+        print("formatting: \(pieces.count) pieces")
+    }
     print(t); exit(0)
 }
 // Smart Rewrite tone bench: N recent real raw dictations + 6 instruction-shaped traps, run through
@@ -73,7 +78,8 @@ if let i = CommandLine.arguments.firstIndex(of: "--stream-test"), i + 1 < Comman
     print("endpoint: \(ep)")
     guard let rt = OpenAIRealtime(model: model, prompt: "", endpoint: ep) else { print("no client"); exit(1) }
     usleep(300_000)
-    for c in chunks { rt.append(pcm16: c); usleep(10_000) }
+    let pace: UInt32 = ProcessInfo.processInfo.environment["SORI_RT_PACE"] == "1" ? 100_000 : 10_000   // 1 = real-time
+    for c in chunks { rt.append(pcm16: c); usleep(pace) }
     let t0 = Date()
     let text = rt.finish(timeout: 8)
     print(String(format: "commit→text %.2fs", Date().timeIntervalSince(t0)))

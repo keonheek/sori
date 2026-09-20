@@ -311,6 +311,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wlog("hub opened (\(section.rawValue))")
     }
 
+    // Typed-over corrections: snapshot the focused field ~0.6 s after the paste, then poll its AX
+    // value for 20 s. If the pasted span changed by a word or two, learn it like a clipboard fix.
+    private var fieldWatchGen = 0
+    func watchFieldForCorrection(of pasted: String) {
+        fieldWatchGen += 1
+        let gen = fieldWatchGen
+        let sys = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success, let f = focusedRef else { return }
+        let el = f as! AXUIElement
+        func value() -> String? {
+            var v: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(el, kAXValueAttribute as CFString, &v) == .success else { return nil }
+            return v as? String
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            guard let self, gen == self.fieldWatchGen, let v0 = value(), let r0 = v0.range(of: pasted) else { return }
+            let start = v0.distance(from: v0.startIndex, to: r0.lowerBound)
+            var polls = 0
+            func poll() {
+                guard gen == self.fieldWatchGen, polls < 10 else { return }
+                polls += 1
+                if let v1 = value(), v1 != v0 {
+                    // Same prefix before the paste, then the (possibly edited) span, then the same suffix.
+                    let prefix = String(v0.prefix(start))
+                    let suffixLen = v0.count - start - pasted.count
+                    let suffix = String(v0.suffix(suffixLen))
+                    if v1.hasPrefix(prefix), v1.hasSuffix(suffix), v1.count >= prefix.count + suffix.count {
+                        let span = String(v1.dropFirst(prefix.count).dropLast(suffix.count))
+                        if span != pasted, !span.isEmpty {
+                            wlog("typed-over edit detected in field")
+                            self.considerCorrection(from: pasted, to: span)
+                            return
+                        }
+                    }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { poll() }
+            }
+            poll()
+        }
+    }
+
     // MARK: Undo AI edit — swap the text just pasted for the raw transcript (and back)
     struct LastPaste { let pasted: String; let final: String; let raw: String; let at: Date; var showingRaw: Bool }
     var lastPaste: LastPaste?
@@ -951,19 +993,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let style = StyleResolver.setting(cfg: cfg, category: category)
             let level = style.levelValue
             wlog("style: \(category.rawValue) \(style.tone)/\(style.level) — \(context.summary)")
-            if level != .none { text = TextCleanup.clean(text) }
-            // LLM passes skip short dictations: quick commands ("open Notion", "yes let's do it")
-            // have nothing to fix, and the ~1s Groq round-trip is pure latency there.
-            let wordCount = text.split(whereSeparator: { $0.isWhitespace }).count
+            // Spoken formatting ("new paragraph", "scratch that"): split into pieces first so the
+            // command words never reach the LLM; each piece is cleaned/rewritten on its own.
+            let pieces: [Formatting.Piece] = Formatting.hasCommands(text) ? Formatting.parse(text) : [.text(text)]
+            if pieces.count > 1 { wlog("formatting commands: \(pieces.count) pieces") }
             let tRewrite = Date()
-            if level == .high && wordCount >= 3 {
-                wlog("smart rewrite ctx: \(context.kind.rawValue) — \(context.summary)")
-                if let r = LLMCleanup.smartRewrite(text, context: context, tone: style.toneValue) { text = r }
-            } else if level == .medium && wordCount >= 5, let rewritten = LLMCleanup.rewrite(text) {
-                text = rewritten
-                // A deleted leading filler ("Um, so ...") leaves a lowercase start; re-tidy.
-                text = TextCleanup.clean(text)
+            func process(_ piece: String) -> String {
+                var t = piece
+                if level != .none { t = TextCleanup.clean(t) }
+                // LLM passes skip short dictations: quick commands ("open Notion", "yes let's do it")
+                // have nothing to fix, and the ~1s Groq round-trip is pure latency there.
+                let wordCount = t.split(whereSeparator: { $0.isWhitespace }).count
+                if level == .high && wordCount >= 3 {
+                    if let r = LLMCleanup.smartRewrite(t, context: context, tone: style.toneValue) { t = r }
+                } else if level == .medium && wordCount >= 5, let rewritten = LLMCleanup.rewrite(t) {
+                    t = TextCleanup.clean(rewritten)   // a deleted leading filler leaves a lowercase start
+                }
+                return t
             }
+            if level == .high { wlog("smart rewrite ctx: \(context.kind.rawValue) — \(context.summary)\(context.fieldText.isEmpty ? "" : " — before: \(context.fieldText.count) chars")") }
+            var processed = [String](repeating: "", count: pieces.count)
+            let group = DispatchGroup()
+            for (i, piece) in pieces.enumerated() {
+                guard case .text(let t) = piece else { continue }
+                group.enter()
+                DispatchQueue.global(qos: .userInitiated).async { processed[i] = process(t); group.leave() }
+            }
+            group.wait()
+            text = Formatting.join(pieces.enumerated().map { i, p in
+                if case .br = p { return p }
+                return .text(processed[i])
+            })
             rewriteMs = Int(Date().timeIntervalSince(tRewrite) * 1000)
             // Snippets: a dictation that opens with a trigger phrase becomes its expansion.
             if let (expanded, trig) = SnippetRepo.expand(text) {
@@ -1024,8 +1084,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             lastPaste = nil
         }
         // Learn-from-edits: remember what we pasted; if the user soon copies a close
-        // variant (an in-place correction), infer a replacement rule.
-        if cfg.learnEdits ?? true { self.watchForCorrection(of: text) }
+        // variant (an in-place correction), infer a replacement rule — and also watch the
+        // field itself (AX value) for a typed-over correction, which is how people actually fix it.
+        if cfg.learnEdits ?? true { self.watchForCorrection(of: text); self.watchFieldForCorrection(of: text) }
         // Press Enter to submit when: the global setting is on, OR the user
         // ended this recording by pressing Enter (which we consumed).
         if submit {
