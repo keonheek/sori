@@ -25,6 +25,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var cfg = Config.load()
     var settings: SettingsController?
     var hub: HubController?
+    private var termSource: DispatchSourceSignal?
 
     var rightCmdDown = false
     var otherKeyDuringCmd = false
@@ -129,6 +130,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
         }
         installTap()
+
+        // launchctl kill / kickstart -k deliver SIGTERM, which never reaches applicationWillTerminate;
+        // the qwen_server child was surviving every redeploy as an orphan on :8918 (2026-09-20).
+        signal(SIGTERM, SIG_IGN)
+        termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        termSource?.setEventHandler { wlog("SIGTERM — stopping qwen_server and exiting"); QwenServer.stop(); exit(0) }
+        termSource?.resume()
 
         // Preload the warm engine so even the FIRST dictation skips the model load.
         // Off the main thread — server spawn + model load takes ~2s.

@@ -56,6 +56,18 @@ enum QwenServer {
         return ok
     }
 
+    // Anything listening on the port (healthy or not) — a plain TCP connect, no HTTP.
+    static func portInUse() -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET); addr.sin_port = in_port_t(port).bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let rc = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        return rc == 0
+    }
+
     static func ensureRunning(modelPath: String) {
         lock.lock(); defer { lock.unlock() }
         if healthy() {
@@ -72,6 +84,17 @@ enum QwenServer {
             try? kill.run(); kill.waitUntilExit()
             proc = nil; runningModel = nil
             usleep(300_000)   // let the port free up before respawn
+        } else if proc == nil, portInUse() {
+            // Not healthy, not ours: an orphan from a previous Sori process that never finished
+            // loading — its stdout pipe died with the parent, the load thread hit BrokenPipe,
+            // and it sat on :8918 forever while every fresh spawn died with EADDRINUSE
+            // (2026-09-20, three redeploys in a row). Clear it before spawning.
+            wlog("qwen_server on :\(port) is unresponsive and not ours — killing the orphan")
+            let kill = Process()
+            kill.launchPath = "/usr/bin/pkill"
+            kill.arguments = ["-f", "qwen_server.py.*--port \(port)"]
+            try? kill.run(); kill.waitUntilExit()
+            usleep(300_000)
         }
         // A spawn may still be loading the model (health returns 503 during load) —
         // don't stack a second one on top.
