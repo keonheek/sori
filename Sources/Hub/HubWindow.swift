@@ -20,6 +20,7 @@ struct HubRootView: View {
             case .dictionary: DictionaryView(model: model)
             case .snippets: SnippetsView(model: model)
             case .style: StyleView(model: model)
+            case .settings: SettingsView(model: model)
             }
         }
         .frame(minWidth: 760, minHeight: 480)

@@ -63,6 +63,9 @@ struct Config: Codable {
     // Replaces the cleanupEnabled / llmCleanup / smartRewrite trio as the thing the pipeline reads
     // (those stay for decoding and seed the defaults — see StyleResolver). 2026-09-20.
     var styles: [String: StyleSetting]? = nil
+    var historyRetentionDays: Int? = nil   // 0/nil = forever; purge older rows at launch
+    var commandMode: Bool? = nil           // Experimental: Right ⌘ + Right ⌥ edits the selection
+    var streamingASR: Bool? = nil          // Experimental: transcribe while recording (OpenAI)
 
     // Style anchor appended to every whisper prompt. Whisper mimics the prompt's WRITING
     // STYLE — a punctuated prose prompt yields punctuated output; the old bare comma-list

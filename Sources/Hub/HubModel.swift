@@ -8,11 +8,13 @@ final class HubModel: ObservableObject {
         case dictionary = "Dictionary"
         case snippets = "Snippets"
         case style = "Style"
+        case settings = "Settings"
         var id: String { rawValue }
         var symbol: String {
             switch self {
             case .home: return "house"; case .dictionary: return "character.book.closed"
             case .snippets: return "text.insert"; case .style: return "slider.horizontal.3"
+            case .settings: return "gearshape"
             }
         }
     }
@@ -27,6 +29,27 @@ final class HubModel: ObservableObject {
     @Published var cfg = Config.load()
     @Published var overrides: [AppStyleRepo.Override] = []
     @Published var seenApps: [AppStyleRepo.SeenApp] = []
+    @Published var inputs: [InputDevice.Info] = []
+    @Published var loginItem = LoginItem.isEnabled()
+    static let configChanged = Notification.Name("sori.configChanged")
+    static var defaultRecordingsDir: String { (NSHomeDirectory() as NSString).appendingPathComponent("Dev/sori/tests/eval/personal/raw") }
+
+    // Read-modify-write on the conf file, then tell the app. Optional keys use `default` for display.
+    func binding<T: Equatable>(_ kp: WritableKeyPath<Config, T?>, default d: T) -> Binding<T> {
+        Binding(get: { self.cfg[keyPath: kp] ?? d }, set: { self.set(kp, $0) })
+    }
+    func binding<T: Equatable>(_ kp: WritableKeyPath<Config, T>, default d: T) -> Binding<T> {
+        Binding(get: { self.cfg[keyPath: kp] }, set: { self.set(kp, $0) })
+    }
+    func set<T>(_ kp: WritableKeyPath<Config, T>, _ v: T) {
+        var fresh = Config.load()
+        fresh[keyPath: kp] = v
+        fresh.save()
+        cfg = fresh
+        NotificationCenter.default.post(name: HubModel.configChanged, object: nil)
+    }
+    func setLoginItem(_ on: Bool) { LoginItem.set(enabled: on); loginItem = LoginItem.isEnabled() }
+    func clearHistory() { Database.shared.run("DELETE FROM dictations"); wlog("history cleared by user"); reload() }
 
     private var subs: [AnyCancellable] = []
 
@@ -66,6 +89,8 @@ final class HubModel: ObservableObject {
 
     func reload() {
         cfg = Config.load()
+        inputs = InputDevice.allInputs()
+        loginItem = LoginItem.isEnabled()
         overrides = AppStyleRepo.overrides()
         seenApps = AppStyleRepo.seenApps()
         stats = DictationRepo.stats()

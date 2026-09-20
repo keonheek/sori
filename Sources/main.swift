@@ -47,6 +47,12 @@ if let i = CommandLine.arguments.firstIndex(of: "--rewrite-bench") {
     }
     exit(0)
 }
+if let i = CommandLine.arguments.firstIndex(of: "--onboard-snapshot"), i + 1 < CommandLine.arguments.count {
+    let snapApp = NSApplication.shared
+    snapApp.setActivationPolicy(.prohibited)
+    let ok = MainActor.assumeIsolated { OnboardingController.snapshot(to: CommandLine.arguments[i + 1]) }
+    print(ok ? "wrote \(CommandLine.arguments[i + 1])" : "snapshot FAILED"); exit(ok ? 0 : 1)
+}
 // Headless Hub render for review: never orders a window front, no dock icon, exits when written.
 if let i = CommandLine.arguments.firstIndex(of: "--hub-snapshot"), i + 1 < CommandLine.arguments.count {
     let snapApp = NSApplication.shared

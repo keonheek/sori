@@ -23,7 +23,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var eventTap: CFMachPort?
     let panel = RecordingPanel()
     var cfg = Config.load()
-    var settings: SettingsController?
     var hub: HubController?
     private var termSource: DispatchSourceSignal?
 
@@ -61,6 +60,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // lockFd is intentionally never closed — the lock must live exactly as long as the process.
         DictionaryRepo.migrateFromConfigIfNeeded()
         cfg = Config.load()
+        if let days = cfg.historyRetentionDays, days > 0 {
+            let cutoff = Date().addingTimeInterval(-Double(days) * 86400).timeIntervalSince1970
+            Database.shared.run("DELETE FROM dictations WHERE ts < ?", [.real(cutoff)])
+        }
+        NotificationCenter.default.addObserver(forName: HubModel.configChanged, object: nil, queue: .main) { [weak self] _ in self?.applyConfigChange() }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         setStatusIcon("mic")
         statusItem.menu = buildMainMenu()
@@ -138,6 +142,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         termSource?.setEventHandler { wlog("SIGTERM — stopping qwen_server and exiting"); QwenServer.stop(); exit(0) }
         termSource?.resume()
 
+        // First run (or a lost permission): the setup window. Never on a machine that has been
+        // through it — `onboarded` is set when the window closes.
+        let needsSetup = Database.shared.meta("onboarded") == nil || !trusted || hidAccess != kIOHIDAccessTypeGranted
+        if CommandLine.arguments.contains("--onboard") || needsSetup { openOnboarding() }
+
         // Preload the warm engine so even the FIRST dictation skips the model load.
         // Off the main thread — server spawn + model load takes ~2s.
         if cfg.warmEngine ?? true {
@@ -201,6 +210,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Setup…", action: #selector(openOnboarding), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Sori \(soriVersion)", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -364,22 +374,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         paste(d.final, submit: false, dictationId: nil)
     }
 
-    @objc func openSettings() {
-        if settings == nil {
-            settings = SettingsController()
-            settings?.onSave = { [weak self] c in
-                self?.cfg = c
-                self?.panel.style = c.panelStyle ?? "classic"
-                // Settings writes the whole config back, so re-apply the indicator's visibility
-                // and rebuild the menu from it — otherwise the checkmark and the screen disagree.
-                self?.panel.compactHidden = c.compactHidden ?? false
-                self?.statusItem.menu = self?.buildMainMenu()
-                wlog("settings applied")
-            }
-        } else { settings?.reloadFromDisk() }
-        NSApp.activate(ignoringOtherApps: true)
-        settings?.showWindow(nil)
-        settings?.window?.makeKeyAndOrderFront(nil)
+    @objc func openSettings() { openHub(section: .settings) }
+
+    var onboarding: OnboardingController?
+    @objc func openOnboarding() {
+        if onboarding == nil { onboarding = OnboardingController() }
+        onboarding?.perms.refresh()
+        onboarding?.show()
+        wlog("onboarding opened")
+    }
+
+    // Settings changed from the Hub: re-read and apply what has a live effect.
+    func applyConfigChange() {
+        cfg = Config.load()
+        panel.compactHidden = cfg.compactHidden ?? false
+        panel.style = cfg.panelStyle ?? "classic"
+        statusItem.menu = buildMainMenu()
+        wlog("settings applied (hub)")
     }
 
     func installTap() {
