@@ -416,7 +416,11 @@ Examples (input => output):
         let body: [String: Any] = [
             "model": "qwen/qwen3.8-27b",
             "reasoning_effort": "none",
-            "max_tokens": 1024,
+            // Groq free tier: 1000 output tokens/min on qwen3.8-27b, checked against max_tokens
+            // up front ("Request too large ... OTPM: Limit 1000, Requested 1024", 2026-09-20).
+            // Output ≈ input for this pass, so size the cap to the text: chars/2 + 64 is a
+            // ceiling for Korean (≈1 token per 1–2 chars) and generous for English (≈4 chars).
+            "max_tokens": min(1000, max(128, text.utf8.count / 2 + 64)),
             "temperature": 0,
             "messages": [
                 ["role": "system", "content": system],
@@ -534,7 +538,11 @@ Examples (input => output):
         let body: [String: Any] = [
             "model": "qwen/qwen3.8-27b",
             "reasoning_effort": "none",   // no <think> block; the raw model leaked one 2026-07-21
-            "max_tokens": 1024,
+            // Groq free tier: 1000 output tokens/min on qwen3.8-27b, checked against max_tokens
+            // up front ("Request too large ... OTPM: Limit 1000, Requested 1024", 2026-09-20).
+            // Output ≈ input for this pass, so size the cap to the text: chars/2 + 64 is a
+            // ceiling for Korean (≈1 token per 1–2 chars) and generous for English (≈4 chars).
+            "max_tokens": min(1000, max(128, text.utf8.count / 2 + 64)),
             "temperature": 0,
             "messages": [
                 ["role": "system", "content": system],
@@ -882,7 +890,7 @@ enum OpenAITranscribe {
 // MARK: - Version + updates
 // THE single source of truth for the version. install.sh and make-release.sh both grep this
 // line for the bundle plist and the release zip name, so there is exactly one number to bump.
-let soriVersion = "1.0.9"
+let soriVersion = "1.0.10"
 
 // "Check for Updates…" — what it can actually do depends on how Sori was installed, because
 // macOS ties Accessibility/Input Monitoring grants to the code signature:
@@ -1065,11 +1073,16 @@ enum InputDevice {
     }
     // The device the recorder should pin, or nil to use the default. Logs the decision.
     static func preferred(avoidBluetooth: Bool) -> Info? {
+        let t0 = DispatchTime.now().uptimeNanoseconds
         guard avoidBluetooth, let def = systemDefault(), isBluetooth(def.transport) else { return nil }
+        let t1 = DispatchTime.now().uptimeNanoseconds
         guard let mic = builtInMic() else {
             wlog("default input '\(def.name)' is Bluetooth but no built-in mic found — using it anyway"); return nil
         }
-        wlog("default input '\(def.name)' is Bluetooth — capturing from '\(mic.name)' so it stays on A2DP")
+        let t2 = DispatchTime.now().uptimeNanoseconds
+        // Timings: both queries were ~40ms until 2026-09-20 23:09 when they jumped to ~400ms
+        // per press with AirPods idle-connected; the split says which CoreAudio call stalls.
+        wlog("default input '\(def.name)' is Bluetooth — capturing from '\(mic.name)' so it stays on A2DP (default \((t1-t0)/1_000_000)ms, enumerate \((t2-t1)/1_000_000)ms)")
         return mic
     }
 }
@@ -2420,7 +2433,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     var rightCmdDown = false
     var otherKeyDuringCmd = false
-    var cmdDownTimeNs: UInt64 = 0      // when right ⌘ went down (monotonic)
+    var cmdDownTimeNs: UInt64 = 0      // CGEvent.timestamp of the right ⌘ down (ns since boot)
     var startedThisPress = false        // did this ⌘-press start a recording?
     var submitAfterPaste = false        // set when Enter ended the recording — auto-press Enter after paste
     // Short press (< 400ms) = TAP: start now, keep recording, next tap stops.
@@ -2727,7 +2740,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     // Right ⌘ pressed.
                     delegate.rightCmdDown = true
                     delegate.otherKeyDuringCmd = false
-                    delegate.cmdDownTimeNs = DispatchTime.now().uptimeNanoseconds
+                    // Event timestamp, not wall clock: startRecording() below runs synchronously
+                    // in this callback and the AirPods-pinned HAL path took 400ms+ on 2026-09-20
+                    // (CoreAudio device query stalled), so the queued key-UP was processed ~460ms
+                    // after the press and a quick tap read as a HOLD -> instant stop, empty paste.
+                    delegate.cmdDownTimeNs = event.timestamp
                     delegate.startedThisPress = false
                     if !delegate.isRecording {
                         // Begin recording immediately — supports HOLD-to-talk.
@@ -2740,7 +2757,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     let clean = wasDown && !delegate.otherKeyDuringCmd
                     delegate.rightCmdDown = false
                     guard clean else { return Unmanaged.passRetained(event) }
-                    let heldNs = DispatchTime.now().uptimeNanoseconds &- delegate.cmdDownTimeNs
+                    let heldNs = event.timestamp &- delegate.cmdDownTimeNs
                     let wasHold = heldNs >= delegate.holdThresholdNs
                     if delegate.startedThisPress {
                         // This press started the recording.
