@@ -613,10 +613,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func startRecording() {
         isRecording = true; wlog(">>> startRecording")
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        func ms() -> UInt64 { (DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000 }
         cfg = Config.load()  // pick up latest settings each session
+        panel.show()         // indicator first: it is the "I heard you" signal
         if cfg.sound { Sounds.play("start") }
         DispatchQueue.main.async { self.setStatusIcon("mic.fill", tint: .systemRed) }
-        panel.show()
         // Warn (non-blocking) if the mic looks unusable — surfaces the #1 silent-failure
         // cause. AFTER show(): show() resets the panel to the dots state, so setting the
         // warning first meant it was wiped instantly.
@@ -646,7 +648,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 wlog("streaming session opened")
             }
         }
+        let tPre = ms()
         recorder.start()
+        wlog("start timing: pre-capture \(tPre)ms, capture \(ms() - tPre)ms")
         // Live preview is OFF by default — it runs a second whisper process during recording,
         // which competes for compute. Only start it when explicitly enabled, and use a FAST model.
         // Gate on the SAME condition setPartial renders under: the compact panel has no room for
