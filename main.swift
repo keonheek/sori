@@ -852,6 +852,8 @@ class AudioRecorder {
     // NaN = "not seeded yet"; the first buffer of each recording seeds it.
     private var floorDb: Float = .nan
     private var loggedBufferSize = false
+    // Wall-clock of the last tap buffer, read by the config-change guard below.
+    private var lastBufferAt: TimeInterval = 0
 
     func start() {
         if !ensureWorkDir() { wlog("recorder ABORT — work dir gone and could not be recreated") }
@@ -885,6 +887,7 @@ class AudioRecorder {
         converter = AVAudioConverter(from: inFormat, to: targetFormat)
         input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { [weak self] buf, _ in
             guard let self else { return }
+            self.lastBufferAt = Date().timeIntervalSince1970
             if !self.loggedBufferSize { self.loggedBufferSize = true; wlog("tap buffer frames=\(buf.frameLength)") }
             if let ch = buf.floatChannelData?[0] {
                 let n = Int(buf.frameLength); var sum: Float = 0
@@ -918,6 +921,25 @@ class AudioRecorder {
 
     private func rebuildAfterConfigChange() {
         guard let old = engine, audioFile != nil else { return }   // not recording anymore
+        // An engine pinned to a non-default device posts ConfigurationChange on every start
+        // (observed 2026-09-20: rebuild → notification → rebuild, every ~250ms, so a 3s
+        // dictation kept 32ms of speech). Only a capture that has actually gone quiet needs
+        // a rebuild: re-check after a short grace and bail if buffers are still flowing.
+        if old.isRunning {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self, self.engine === old, self.audioFile != nil else { return }
+                let quiet = Date().timeIntervalSince1970 - self.lastBufferAt
+                if quiet < 0.25 { wlog("config change ignored — tap still live (\(Int(quiet*1000))ms ago)"); return }
+                wlog("config change: tap quiet for \(Int(quiet*1000))ms — rebuilding")
+                self.rebuildNow(old)
+            }
+            return
+        }
+        wlog("config change: engine stopped — rebuilding")
+        rebuildNow(old)
+    }
+
+    private func rebuildNow(_ old: AVAudioEngine) {
         old.inputNode.removeTap(onBus: 0)
         if old.isRunning { old.stop() }
         // Reusing a stopped engine after a device swap is unreliable — start clean.
