@@ -32,6 +32,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var startedThisPress = false        // did this ⌘-press start a recording?
     var submitAfterPaste = false        // set when Enter ended the recording — auto-press Enter after paste
     var commandModeArmed = false        // Right ⌥ pressed while Right ⌘ held → this recording is an instruction
+    var streamClient: OpenAIRealtime?   // live while a streaming (P7) recording runs
     // Short press (< 400ms) = TAP: start now, keep recording, next tap stops.
     // Longer press (>= 400ms) = HOLD: recording stops the moment you let go.
     let holdThresholdNs: UInt64 = 400_000_000  // 400ms
@@ -592,6 +593,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         recorder.pinnedDeviceUID = cfg.inputDeviceUID
         panel.setLocked(false)
         commandModeArmed = false
+        // Streaming (Experimental): open the realtime session now and feed audio as it is captured,
+        // so release only waits for the tail. Batch upload stays the fallback on any failure.
+        streamClient = nil; recorder.onPCM24k = nil
+        if (cfg.streamingASR ?? false), (cfg.asrProvider ?? "local") == "openai" {
+            let hint = [cfg.promptHint, DictionaryRepo.biasPrompt(cfg: cfg)].filter { !$0.isEmpty }.joined(separator: ", ")
+            if let c = OpenAIRealtime(model: cfg.asrCloudModel ?? "gpt-transcribe", prompt: hint) {
+                streamClient = c
+                recorder.onPCM24k = { [weak c] data in c?.append(pcm16: data) }
+                wlog("streaming session opened")
+            }
+        }
         recorder.start()
         // Live preview is OFF by default — it runs a second whisper process during recording,
         // which competes for compute. Only start it when explicitly enabled, and use a FAST model.
@@ -608,6 +620,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func cancelRecording() {
         isRecording = false; wlog(">>> cancelRecording (ESC)")
         stopPartialTimer()
+        recorder.onPCM24k = nil; streamClient?.cancel(); streamClient = nil
         recorder.cancel()
         DispatchQueue.main.async {
             self.setStatusIcon("mic")
@@ -713,6 +726,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let context = AppContext.capture()
         let asCommand = commandModeArmed
         commandModeArmed = false
+        recorder.onPCM24k = nil
+        let stream = streamClient; streamClient = nil
+        if asCommand { stream?.cancel() }
         let selection = asCommand ? CommandMode.selectedText() : nil
         if asCommand { wlog("command mode: selection \(selection.map { "\($0.count) chars" } ?? "none")") }
         recorder.stop { url in
@@ -730,7 +746,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             self.transcribeQueue.async {
                 if asCommand { self.runCommand(url: URL(fileURLWithPath: unique), cfg: cfg, selection: selection) }
-                else { self.transcribe(url: URL(fileURLWithPath: unique), cfg: cfg, submit: submit, context: context) }
+                else { self.transcribe(url: URL(fileURLWithPath: unique), cfg: cfg, submit: submit, context: context, stream: stream) }
                 try? FileManager.default.removeItem(atPath: unique)
             }
         }
@@ -788,7 +804,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func transcribe(url: URL, cfg: Config, submit: Bool, context: AppContext) {
+    private func transcribe(url: URL, cfg: Config, submit: Bool, context: AppContext, stream: OpenAIRealtime? = nil) {
             let tStart = Date()
             var asrMs = 0, rewriteMs = 0
             let wavBytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
@@ -827,11 +843,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let gate = QwenServer.hasSpeech(wav: url.path)
                 if gate == false {
                     cloudText = ""
+                    stream?.cancel()
                     wlog("vad gate: no speech — cloud transcribe skipped")
                 } else {
-                    let hint = [cfg.promptHint, vocabulary].filter { !$0.isEmpty }.joined(separator: ", ")
-                    cloudText = OpenAITranscribe.transcribe(wav: url.path, model: cfg.asrCloudModel ?? "gpt-transcribe", prompt: hint)
-                    if cloudText == nil { wlog("openai transcribe FAILED — falling back to local qwen") }
+                    // Streaming session first (only the tail is pending), batch upload if it failed.
+                    if let s = stream { cloudText = s.finish(timeout: 4) }
+                    if cloudText == nil {
+                        let hint = [cfg.promptHint, vocabulary].filter { !$0.isEmpty }.joined(separator: ", ")
+                        cloudText = OpenAITranscribe.transcribe(wav: url.path, model: cfg.asrCloudModel ?? "gpt-transcribe", prompt: hint)
+                        if cloudText == nil { wlog("openai transcribe FAILED — falling back to local qwen") }
+                    }
                 }
             }
             if let c = cloudText {

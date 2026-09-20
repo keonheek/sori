@@ -18,6 +18,10 @@ class AudioRecorder {
     private var hal: HALCapture?      // pinned-device path; engine stays nil while this is live
     private var audioFile: AVAudioFile?
     private var converter: AVAudioConverter?
+    // Streaming (P7): a second converter feeds 24 kHz int16 chunks to whoever is listening.
+    private var converter24: AVAudioConverter?
+    private let streamFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000, channels: 1, interleaved: true)!
+    var onPCM24k: ((Data) -> Void)?
     private let outputURL = URL(fileURLWithPath: workPath("sori.wav"))
     private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
                                              sampleRate: 16000, channels: 1, interleaved: true)!
@@ -40,6 +44,7 @@ class AudioRecorder {
                   let fmt = cap.format else { wlog("recorder ABORT — HAL capture unavailable"); return }
             guard openFile() else { return }
             converter = AVAudioConverter(from: fmt, to: targetFormat)
+            converter24 = AVAudioConverter(from: fmt, to: streamFormat)
             hal = cap
             if cap.start() { wlog("HAL started") } else { hal = nil; audioFile = nil }
             return
@@ -85,6 +90,16 @@ class AudioRecorder {
             fed = true; status.pointee = .haveData; return buf
         }
         if outBuf.frameLength > 0 { try? file.write(from: outBuf) }
+        if let emit = onPCM24k, let c24 = converter24 {
+            let cap = AVAudioFrameCount(Double(buf.frameLength) * (streamFormat.sampleRate / buf.format.sampleRate)) + 1024
+            guard let b24 = AVAudioPCMBuffer(pcmFormat: streamFormat, frameCapacity: cap) else { return }
+            var fed24 = false; var e24: NSError?
+            c24.convert(to: b24, error: &e24) { _, status in
+                if fed24 { status.pointee = .noDataNow; return nil }
+                fed24 = true; status.pointee = .haveData; return buf
+            }
+            if b24.frameLength > 0 { emit(Data(bytes: b24.int16ChannelData![0], count: Int(b24.frameLength) * 2)) }
+        }
     }
 
     // Tap + converter for the engine's CURRENT input format. The removeTap first is
@@ -95,6 +110,7 @@ class AudioRecorder {
         input.removeTap(onBus: 0)
         let inFormat = input.inputFormat(forBus: 0)
         converter = AVAudioConverter(from: inFormat, to: targetFormat)
+        converter24 = AVAudioConverter(from: inFormat, to: streamFormat)
         input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { [weak self] buf, _ in
             self?.consume(buf)
         }

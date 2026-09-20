@@ -63,6 +63,22 @@ if let i = CommandLine.arguments.firstIndex(of: "--command-test"), i + 1 < Comma
     }
     exit(0)
 }
+// Streaming probe: --stream-test <16k wav> [model]. Feeds the clip in 100 ms chunks, commits, prints
+// the transcript and the commit→text latency. The real-authenticated round-trip P7 is gated on.
+if let i = CommandLine.arguments.firstIndex(of: "--stream-test"), i + 1 < CommandLine.arguments.count {
+    let model = i + 2 < CommandLine.arguments.count ? CommandLine.arguments[i + 2] : "gpt-transcribe"
+    let chunks = OpenAIRealtime.pcm24k(fromWav: CommandLine.arguments[i + 1])
+    print("chunks: \(chunks.count) (\(chunks.count / 10)s of audio)")
+    let ep = ProcessInfo.processInfo.environment["SORI_RT_ENDPOINT"] ?? "wss://api.openai.com/v1/realtime?intent=transcription"
+    print("endpoint: \(ep)")
+    guard let rt = OpenAIRealtime(model: model, prompt: "", endpoint: ep) else { print("no client"); exit(1) }
+    usleep(300_000)
+    for c in chunks { rt.append(pcm16: c); usleep(10_000) }
+    let t0 = Date()
+    let text = rt.finish(timeout: 8)
+    print(String(format: "commit→text %.2fs", Date().timeIntervalSince(t0)))
+    print(text ?? "<nil>"); exit(text == nil ? 1 : 0)
+}
 // Headless Hub render for review: never orders a window front, no dock icon, exits when written.
 if let i = CommandLine.arguments.firstIndex(of: "--hub-snapshot"), i + 1 < CommandLine.arguments.count {
     let snapApp = NSApplication.shared
