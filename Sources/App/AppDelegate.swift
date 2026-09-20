@@ -377,7 +377,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Select the text that was just pasted, ending at the caret. AX selected-range first (exact,
     // works in Cocoa text views and most Electron/Chromium fields); fall back to ⇧← N times.
-    private func selectBack(_ pasted: String) -> Bool {
+    private func selectBack(_ pasted: String, allowKeyFallback: Bool = true) -> Bool {
         let n = pasted.utf16.count
         let sys = AXUIElementCreateSystemWide()
         var focusedRef: CFTypeRef?
@@ -398,7 +398,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         let count = pasted.count
-        guard count <= 3000 else { return false }
+        guard allowKeyFallback, count <= 3000 else { return false }
         let src = wpttEventSource()
         for _ in 0..<count {
             let d = CGEvent(keyboardEventSource: src, virtualKey: 0x7B, keyDown: true)
@@ -1016,6 +1016,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return t
             }
             if level == .high { wlog("smart rewrite ctx: \(context.kind.rawValue) — \(context.summary)\(context.fieldText.isEmpty ? "" : " — before: \(context.fieldText.count) chars")") }
+            // Instant paste (Experimental): put the rule-cleaned text in the field now and swap in the
+            // rewrite when it arrives — only if the field still holds exactly what we pasted (AX check,
+            // no ⇧← fallback), and never when this dictation was submitted with Enter.
+            let instant = (cfg.instantPaste ?? false) && level == .high && !submit && pieces.count == 1
+            var instantId: Int64? = nil
+            if instant, case .text(let t0) = pieces[0] {
+                let quick = TextCleanup.clean(t0)
+                let id = DictationRepo.insert(.init(ts: tStart, context: context, raw: raw, final: quick, provider: provider,
+                                                    audioMs: audioMs, asrMs: asrMs, rewriteMs: 0,
+                                                    totalMs: Int(Date().timeIntervalSince(tStart) * 1000), audioPath: keptPath))
+                instantId = id
+                DispatchQueue.main.sync {
+                    if !self.isRecording { self.setStatusIcon("mic"); self.panel.hide() }
+                    self.paste(quick, submit: false, dictationId: id, startedAt: tStart)
+                }
+                wlog("instant paste (\(quick.count) chars), refining")
+            }
             var processed = [String](repeating: "", count: pieces.count)
             let group = DispatchGroup()
             for (i, piece) in pieces.enumerated() {
@@ -1035,6 +1052,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 text = expanded
             }
             wlog("raw=\"\(raw)\" -> final=\"\(text)\"")
+            if let id = instantId {
+                // Refine in place: replace the quick paste with the rewrite if it differs and the
+                // field still shows exactly the quick text at the caret.
+                let finalText = text
+                Database.shared.run("UPDATE dictations SET final=?, rewrite_ms=? WHERE id=?", [.text(finalText), .int(Int64(rewriteMs)), .int(id)])
+                DispatchQueue.main.async {
+                    guard let lp = self.lastPaste, lp.showingRaw == false, finalText != lp.pasted else { return }
+                    if self.selectBack(lp.pasted, allowKeyFallback: false) {
+                        let pb = NSPasteboard.general
+                        pb.declareTypes([.string], owner: nil); pb.setString(finalText, forType: .string)
+                        let src = wpttEventSource()
+                        let down = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: true)
+                        let up = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)
+                        down?.flags = .maskCommand; up?.flags = .maskCommand
+                        down?.post(tap: .cgAnnotatedSessionEventTap); up?.post(tap: .cgAnnotatedSessionEventTap)
+                        self.lastPaste = LastPaste(pasted: finalText, final: finalText, raw: raw, at: Date(), showingRaw: false)
+                        wlog("instant paste refined in place")
+                    } else {
+                        wlog("instant paste: field changed, refinement skipped (raw kept)")
+                    }
+                }
+                return
+            }
             // Every dictation that produced text is a row, pasted or not — Home, stats, undo and
             // the eval set all read this one table.
             let dictationId = DictationRepo.insert(.init(

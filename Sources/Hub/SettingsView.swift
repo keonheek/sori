@@ -99,6 +99,9 @@ struct SettingsView: View {
             SettingRow(label: "Command Mode", detail: "Hold Right ⌘ + Right ⌥, say what to do with the selected text (\"make this shorter\"), release.") {
                 Toggle("", isOn: model.binding(\.commandMode, default: false)).labelsHidden().toggleStyle(.switch)
             }
+            SettingRow(label: "Instant paste", detail: "Paste the rule-cleaned words the moment recognition finishes, then swap in the Smart Rewrite in place (~0.3 s later). Skipped when you send with Enter or start typing.") {
+                Toggle("", isOn: model.binding(\.instantPaste, default: false)).labelsHidden().toggleStyle(.switch)
+            }
             SettingRow(label: "Streaming recognition", detail: "Transcribe while you talk so only the tail is pending on release. OpenAI only; the upload path is the fallback.") {
                 Toggle("", isOn: model.binding(\.streamingASR, default: false)).labelsHidden().toggleStyle(.switch)
             }

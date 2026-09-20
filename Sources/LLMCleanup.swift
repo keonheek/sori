@@ -39,6 +39,7 @@ You are a text-transformation FUNCTION, not an assistant. The user message is a 
 - If the transcript is already clean, return it unchanged.
 \(style)
 \(tone.promptClause)
+\((context.kind == .docs || context.kind == .mail) && text.split(whereSeparator: { $0.isWhitespace }).count > 80 ? "This is a long dictation for a document or email: break it into short paragraphs (2–4 sentences) where the topic shifts, separated by a blank line. Do not add headings or bullets." : "")
 \(context.fieldText.isEmpty ? "" : "The user message may include <before> tags: text that is ALREADY in the field before the cursor. Use it only to match language, register, and continuation (e.g. continue a sentence the speaker started typing). Never repeat, rewrite, or answer it; output only the rewritten transcript.")
 Output ONLY the rewritten text, keeping any line breaks the transcript has, with no quotes, no tags, no explanation.
 

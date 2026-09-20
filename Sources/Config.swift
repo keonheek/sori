@@ -66,6 +66,7 @@ struct Config: Codable {
     var historyRetentionDays: Int? = nil   // 0/nil = forever; purge older rows at launch
     var commandMode: Bool? = nil           // Experimental: Right ⌘ + Right ⌥ edits the selection
     var streamingASR: Bool? = nil          // Experimental: transcribe while recording (OpenAI)
+    var instantPaste: Bool? = nil          // Experimental: paste the rule-cleaned text at once, replace in place when the rewrite lands
     var contextAwareness: Bool? = nil      // send the focused field's text before the caret to Smart Rewrite (default on)
 
     // Style anchor appended to every whisper prompt. Whisper mimics the prompt's WRITING
