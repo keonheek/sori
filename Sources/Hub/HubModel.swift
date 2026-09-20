@@ -7,9 +7,13 @@ final class HubModel: ObservableObject {
         case home = "Home"
         case dictionary = "Dictionary"
         case snippets = "Snippets"
+        case style = "Style"
         var id: String { rawValue }
         var symbol: String {
-            switch self { case .home: return "house"; case .dictionary: return "character.book.closed"; case .snippets: return "text.insert" }
+            switch self {
+            case .home: return "house"; case .dictionary: return "character.book.closed"
+            case .snippets: return "text.insert"; case .style: return "slider.horizontal.3"
+            }
         }
     }
 
@@ -20,6 +24,9 @@ final class HubModel: ObservableObject {
     @Published var dictionary: [DictionaryEntry] = []
     @Published var dictQuery: String = ""
     @Published var snippets: [Snippet] = []
+    @Published var cfg = Config.load()
+    @Published var overrides: [AppStyleRepo.Override] = []
+    @Published var seenApps: [AppStyleRepo.SeenApp] = []
 
     private var subs: [AnyCancellable] = []
 
@@ -36,10 +43,31 @@ final class HubModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.snippets = SnippetRepo.all() }
             .store(in: &subs)
+        NotificationCenter.default.publisher(for: AppStyleRepo.changedNote)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.overrides = AppStyleRepo.overrides() }
+            .store(in: &subs)
         reload()
     }
 
+    func style(_ c: StyleCategory) -> StyleSetting { StyleResolver.setting(cfg: cfg, category: c) }
+    func setStyle(_ c: StyleCategory, tone: Tone? = nil, level: CleanupLevel? = nil) {
+        var st = style(c)
+        if let t = tone { st.tone = t.rawValue }
+        if let l = level { st.level = l.rawValue }
+        var fresh = Config.load()            // never clobber keys another writer changed meanwhile
+        var map = fresh.styles ?? [:]
+        map[c.rawValue] = st
+        fresh.styles = map
+        fresh.save()
+        cfg = fresh
+        wlog("style \(c.rawValue) -> \(st.tone)/\(st.level)")
+    }
+
     func reload() {
+        cfg = Config.load()
+        overrides = AppStyleRepo.overrides()
+        seenApps = AppStyleRepo.seenApps()
         stats = DictationRepo.stats()
         reloadRows()
         dictionary = DictionaryRepo.all()

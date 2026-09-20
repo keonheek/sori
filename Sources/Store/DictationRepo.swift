@@ -83,6 +83,10 @@ enum DictationRepo {
         changed()
     }
 
+    static func get(_ id: Int64) -> Dictation? {
+        Database.shared.query("SELECT * FROM dictations WHERE id=?", [.int(id)]).first.map(Dictation.from)
+    }
+
     static func last() -> Dictation? {
         Database.shared.query("SELECT * FROM dictations ORDER BY ts DESC LIMIT 1").first.map(Dictation.from)
     }

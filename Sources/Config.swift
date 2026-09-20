@@ -59,6 +59,10 @@ struct Config: Codable {
     // The local engine still runs the VAD gate (vad_only) and is the fallback when the API fails.
     var asrProvider: String? = nil
     var asrCloudModel: String? = nil     // default gpt-transcribe ($0.0045/min)
+    // Style per destination category (personal / work / email / other): tone + cleanup level.
+    // Replaces the cleanupEnabled / llmCleanup / smartRewrite trio as the thing the pipeline reads
+    // (those stay for decoding and seed the defaults — see StyleResolver). 2026-09-20.
+    var styles: [String: StyleSetting]? = nil
 
     // Style anchor appended to every whisper prompt. Whisper mimics the prompt's WRITING
     // STYLE — a punctuated prose prompt yields punctuated output; the old bare comma-list

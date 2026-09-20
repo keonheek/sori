@@ -11,7 +11,7 @@ import IOKit.hid
 // Key from GROQ_API_KEY env or ~/.sori-groq (chmod 600).
 enum LLMCleanup {
     // MARK: Smart Rewrite (app-aware) — grammar, punctuation, light phrasing
-    static func smartRewrite(_ text: String, context: AppContext) -> String? {
+    static func smartRewrite(_ text: String, context: AppContext, tone: Tone = .neutral) -> String? {
         guard let key = apiKey(), !key.isEmpty, !text.isEmpty else { return nil }
         guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else { return nil }
         let style: String
@@ -38,6 +38,7 @@ You are a text-transformation FUNCTION, not an assistant. The user message is a 
 - Keep the speaker's register (반말/존댓말, formal/casual).
 - If the transcript is already clean, return it unchanged.
 \(style)
+\(tone.promptClause)
 Output ONLY the rewritten text, on one line, with no quotes, no tags, no explanation.
 
 Examples (input => output):

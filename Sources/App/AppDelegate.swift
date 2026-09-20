@@ -173,12 +173,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastItem.isEnabled = DictationRepo.last() != nil
         menu.addItem(lastItem)
         menu.addItem(NSMenuItem.separator())
-        let cleanupItem = NSMenuItem(title: "Filler Cleanup (Groq)", action: #selector(toggleLLMCleanup(_:)), keyEquivalent: "")
-        cleanupItem.state = (cfg.llmCleanup ?? false) ? .on : .off
-        menu.addItem(cleanupItem)
-        let rewriteItem = NSMenuItem(title: "Smart Rewrite (app-aware, Groq)", action: #selector(toggleSmartRewrite(_:)), keyEquivalent: "")
-        rewriteItem.state = (cfg.smartRewrite ?? false) ? .on : .off
-        menu.addItem(rewriteItem)
+        let undoItem = NSMenuItem(title: "Undo AI Edit", action: #selector(undoAIEdit as () -> Void), keyEquivalent: "")
+        undoItem.isEnabled = (lastPaste.map { $0.raw != $0.final } ?? false)
+        menu.addItem(undoItem)
+        menu.addItem(NSMenuItem(title: "Style…", action: #selector(openStyle), keyEquivalent: ""))
         // Reachable from the menu bar too — otherwise turning the indicator off would hide the
         // only way to turn it back on.
         let indicatorItem = NSMenuItem(title: "Floating Indicator", action: #selector(toggleCompactIndicator(_:)), keyEquivalent: "")
@@ -212,21 +210,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return menu
     }
 
-    @objc func toggleLLMCleanup(_ sender: NSMenuItem) {
-        cfg.llmCleanup = !(cfg.llmCleanup ?? false)
-        sender.state = (cfg.llmCleanup ?? false) ? .on : .off
-        cfg.save()
-        // The sender may be a throwaway right-click menu; rebuild the bar's so both agree.
-        statusItem.menu = buildMainMenu()
-        wlog("llmCleanup toggled -> \(cfg.llmCleanup ?? false)")
-    }
 
-    @objc func toggleSmartRewrite(_ sender: NSMenuItem) {
-        cfg.smartRewrite = !(cfg.smartRewrite ?? false)
-        cfg.save()
-        statusItem.menu = buildMainMenu()
-        wlog("smartRewrite toggled -> \(cfg.smartRewrite ?? false)")
-    }
 
     @objc func toggleCompactIndicator(_ sender: NSMenuItem) {
         let hidden = !(cfg.compactHidden ?? false)
@@ -307,11 +291,69 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openHubAction() { openHub(section: .home) }
+    @objc func openStyle() { openHub(section: .style) }
     func openHub(section: HubModel.Section) {
         if hub == nil { hub = HubController() }
         hub?.model.section = section
         hub?.show()
         wlog("hub opened (\(section.rawValue))")
+    }
+
+    // MARK: Undo AI edit — swap the text just pasted for the raw transcript (and back)
+    struct LastPaste { let pasted: String; let final: String; let raw: String; let at: Date; var showingRaw: Bool }
+    var lastPaste: LastPaste?
+
+    @objc func undoAIEdit() { undoAIEdit(maxAge: 600) }
+    func undoAIEdit(maxAge: TimeInterval) {
+        guard var lp = lastPaste, Date().timeIntervalSince(lp.at) < maxAge else { wlog("undo: nothing recent to undo"); return }
+        guard lp.raw != lp.final else { wlog("undo: nothing changed by AI for this paste"); return }
+        let replacement = lp.showingRaw ? lp.final : lp.raw
+        guard selectBack(lp.pasted) else { wlog("undo: could not select the pasted text back"); panel.setError("Couldn't select the pasted text"); return }
+        let pb = NSPasteboard.general
+        pb.declareTypes([.string], owner: nil); pb.setString(replacement, forType: .string)
+        let src = wpttEventSource()
+        let down = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: true)
+        let up = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)
+        down?.flags = .maskCommand; up?.flags = .maskCommand
+        down?.post(tap: .cgAnnotatedSessionEventTap); up?.post(tap: .cgAnnotatedSessionEventTap)
+        lp.showingRaw.toggle()
+        lastPaste = LastPaste(pasted: replacement, final: lp.final, raw: lp.raw, at: Date(), showingRaw: lp.showingRaw)
+        wlog("undo AI edit -> \(lp.showingRaw ? "raw" : "final") (\(replacement.count) chars)")
+    }
+
+    // Select the text that was just pasted, ending at the caret. AX selected-range first (exact,
+    // works in Cocoa text views and most Electron/Chromium fields); fall back to ⇧← N times.
+    private func selectBack(_ pasted: String) -> Bool {
+        let n = pasted.utf16.count
+        let sys = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success, let f = focusedRef {
+            let el = f as! AXUIElement
+            var rangeRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success, let rv = rangeRef {
+                var cur = CFRange()
+                if AXValueGetValue(rv as! AXValue, .cfRange, &cur), cur.location >= n {
+                    var want = CFRange(location: cur.location - n, length: n)
+                    if let v = AXValueCreate(.cfRange, &want), AXUIElementSetAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, v) == .success {
+                        var selRef: CFTypeRef?
+                        if AXUIElementCopyAttributeValue(el, kAXSelectedTextAttribute as CFString, &selRef) == .success,
+                           let sel = selRef as? String, sel == pasted { return true }
+                        wlog("undo: AX range set but selection mismatch — falling back to ⇧←")
+                    }
+                }
+            }
+        }
+        let count = pasted.count
+        guard count <= 3000 else { return false }
+        let src = wpttEventSource()
+        for _ in 0..<count {
+            let d = CGEvent(keyboardEventSource: src, virtualKey: 0x7B, keyDown: true)
+            let u = CGEvent(keyboardEventSource: src, virtualKey: 0x7B, keyDown: false)
+            d?.flags = .maskShift; u?.flags = .maskShift
+            d?.post(tap: .cgAnnotatedSessionEventTap); u?.post(tap: .cgAnnotatedSessionEventTap)
+        }
+        usleep(UInt32(min(400_000, 2_000 * count)))   // let the target catch up before ⌘V
+        return true
     }
 
     // From the menu bar / indicator menu: the target app keeps focus (the status menu and the
@@ -370,6 +412,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         delegate.submitAfterPaste = true
                         delegate.stopAndTranscribe()
                         return nil   // consume this Enter; we re-issue it after pasting
+                    }
+                    // Right ⌘ + Z within 10 s of a paste = undo the AI edit (raw ⇄ final).
+                    if delegate.rightCmdDown && keycode == 6 {
+                        delegate.noteChord()   // cancels the recording this press started
+                        DispatchQueue.main.async { delegate.undoAIEdit(maxAge: 10) }
+                        return nil
                     }
                     // Escape (53) WHILE recording = cancel, discard audio, no paste.
                     if delegate.isRecording && keycode == 53 {
@@ -808,22 +856,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                        .replacingOccurrences(of: " {2,}", with: " ", options: .regularExpression)
             text = TextCleanup.collapseRepetitionLoop(text)
             text = DictionaryRepo.apply(text)
-            // Wispr-Flow-style cleanup (rule-based): strip fillers, fix disfluencies, tidy.
-            if cfg.cleanupEnabled ?? true { text = TextCleanup.clean(text) }
-            // Optional Tier 2 LLM rewrite for grammar/redundancy. Skipped for short
-            // dictations: quick commands ("open Notion", "yes let's do it") have no
-            // fillers to strip, and the ~1s Groq round-trip is pure latency there.
+            // Style: the destination category (per-app override, else app kind) picks the tone
+            // and the cleanup level. None = raw; Light = rules; Medium = deletion-only LLM;
+            // High = Smart Rewrite with the category's tone.
+            let category = StyleResolver.category(for: context)
+            let style = StyleResolver.setting(cfg: cfg, category: category)
+            let level = style.levelValue
+            wlog("style: \(category.rawValue) \(style.tone)/\(style.level) — \(context.summary)")
+            if level != .none { text = TextCleanup.clean(text) }
+            // LLM passes skip short dictations: quick commands ("open Notion", "yes let's do it")
+            // have nothing to fix, and the ~1s Groq round-trip is pure latency there.
             let wordCount = text.split(whereSeparator: { $0.isWhitespace }).count
-            var rewrote = false
             let tRewrite = Date()
-            if (cfg.smartRewrite ?? false) && wordCount >= 3 {
+            if level == .high && wordCount >= 3 {
                 wlog("smart rewrite ctx: \(context.kind.rawValue) — \(context.summary)")
-                if let r = LLMCleanup.smartRewrite(text, context: context) { text = r; rewrote = true }
-            }
-            if !rewrote && (cfg.llmCleanup ?? false) && wordCount >= 5, let rewritten = LLMCleanup.rewrite(text) {
+                if let r = LLMCleanup.smartRewrite(text, context: context, tone: style.toneValue) { text = r }
+            } else if level == .medium && wordCount >= 5, let rewritten = LLMCleanup.rewrite(text) {
                 text = rewritten
                 // A deleted leading filler ("Um, so ...") leaves a lowercase start; re-tidy.
-                if cfg.cleanupEnabled ?? true { text = TextCleanup.clean(text) }
+                text = TextCleanup.clean(text)
             }
             rewriteMs = Int(Date().timeIntervalSince(tRewrite) * 1000)
             // Snippets: a dictation that opens with a trigger phrase becomes its expansion.
@@ -880,6 +931,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wlog("pasted (clipboard retained for ⌘V recovery)")
         if let id = dictationId {
             DictationRepo.markPasted(id, totalMs: startedAt.map { Int(Date().timeIntervalSince($0) * 1000) })
+            if let d = DictationRepo.get(id) { lastPaste = LastPaste(pasted: text, final: text, raw: d.raw, at: Date(), showingRaw: false) }
+        } else {
+            lastPaste = nil
         }
         // Learn-from-edits: remember what we pasted; if the user soon copies a close
         // variant (an in-place correction), infer a replacement rule.
