@@ -252,7 +252,7 @@ final class RecordingPanel {
         }
     }
     func setTranscribing() {
-        if style == "compact" { return }   // active indicator already covers recording+transcribing
+        if style == "compact" { showCompactTranscribing(); return }
         DispatchQueue.main.async {
             // Keep dots if we never got real text; otherwise leave the text up.
             if self.label?.isHidden ?? true { self.showDots(true) }
@@ -269,6 +269,35 @@ final class RecordingPanel {
                 self.showDots(false)
                 self.label?.stringValue = self.tailTrim(t)
                 self.relayout()
+            }
+        }
+    }
+
+    // Hands-free (tap-to-toggle) vs hold: a 3pt dot at the right end of the active pill says
+    // "locked — tap to stop". Both styles; classic shows it in the label line.
+    func setLocked(_ on: Bool) {
+        DispatchQueue.main.async {
+            self.compactLockDot?.isHidden = !on || self.compactIdleBar?.isHidden == false
+            self.lockedNow = on
+        }
+    }
+    private var lockedNow = false
+
+    // Transient failure the user must see (engine down, no audio): the compact chip flashes red
+    // for 1.6 s and returns to idle; classic shows the message in the panel.
+    func setError(_ msg: String) {
+        DispatchQueue.main.async {
+            if self.style == "compact" {
+                guard let chip = self.compactChip, !self.compactHidden else { return }
+                self.compactWin?.orderFrontRegardless()
+                chip.layer?.backgroundColor = NSColor.systemRed.withAlphaComponent(0.6).cgColor
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+                    chip.layer?.backgroundColor = Self.compactChipColor
+                    self.showCompactIdle()
+                }
+            } else {
+                self.setPartial("⚠︎ \(msg)")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { self.hide() }
             }
         }
     }
@@ -415,6 +444,8 @@ final class RecordingPanel {
     private var compactLevelBars: LevelBarsView?
     private var compactHoverBacking: NSView?
     private var compactChip: NSView?
+    private var compactLockDot: NSView?
+    private static let compactChipColor = NSColor.black.withAlphaComponent(0.45).cgColor
     private var compactScreenFollowTimer: Timer?
     private var compactCurrentScreen: NSScreen?
     private var spaceObserver: Any?
@@ -539,7 +570,7 @@ final class RecordingPanel {
         chip.wantsLayer = true
         // 0.62 -> 0.45: he wanted the whole thing more see-through (2026-07-29). Still opaque
         // enough to keep the white bar legible on a light desktop, which is the chip's only job.
-        chip.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.45).cgColor
+        chip.layer?.backgroundColor = Self.compactChipColor
         chip.layer?.cornerRadius = size.height / 2
         content.addSubview(chip)
         // Hover: a faint pill fades in so it reads as "this is interactive/draggable."
@@ -572,6 +603,13 @@ final class RecordingPanel {
         let levelBars = LevelBarsView(frame: NSRect(origin: .zero, size: size))
         levelBars.isHidden = true
         content.addSubview(levelBars)
+        // Hands-free lock tell: a 3pt dot inside the right end of the active pill.
+        let lockDot = NSView(frame: NSRect(x: size.width - 7, y: size.height / 2 - 1.5, width: 3, height: 3))
+        lockDot.wantsLayer = true
+        lockDot.layer?.backgroundColor = NSColor(calibratedWhite: 1, alpha: 0.9).cgColor
+        lockDot.layer?.cornerRadius = 1.5
+        lockDot.isHidden = true
+        content.addSubview(lockDot)
         win.contentView = content
 
         // Re-pin on display reconfiguration (monitor sleep/wake, resolution change, dock/undock).
@@ -587,7 +625,7 @@ final class RecordingPanel {
         }
 
         compactWin = win; compactIdleBar = bar; compactLevelBars = levelBars; compactHoverBacking = hoverBacking
-        compactChip = chip
+        compactChip = chip; compactLockDot = lockDot
         layoutCompactPill(Self.compactIdlePill, animated: false)   // it comes up neutral
         installSpaceObserver()
     }
@@ -655,10 +693,24 @@ final class RecordingPanel {
     private func showCompactIdle() {
         DispatchQueue.main.async {
             guard !self.compactHidden, let win = self.compactWin else { return }
+            self.compactLevelBars?.layer?.removeAnimation(forKey: "pulse"); self.compactLevelBars?.layer?.opacity = 1
+            self.compactLockDot?.isHidden = true
             self.compactLevelBars?.isHidden = true; self.compactLevelBars?.reset()
             self.compactIdleBar?.isHidden = false
             self.layoutCompactPill(Self.compactIdlePill, animated: true)
             win.orderFrontRegardless()
+        }
+    }
+    // Transcribing: the bars stop following the mic and breathe (opacity pulse) until hide().
+    private func showCompactTranscribing() {
+        DispatchQueue.main.async {
+            guard !self.compactHidden, let bars = self.compactLevelBars, !bars.isHidden else { return }
+            self.compactLockDot?.isHidden = true
+            let a = CABasicAnimation(keyPath: "opacity")
+            a.fromValue = 1.0; a.toValue = 0.35; a.duration = 0.55
+            a.autoreverses = true; a.repeatCount = .infinity
+            a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            bars.layer?.add(a, forKey: "pulse")
         }
     }
     private func showCompactActive() {
@@ -666,6 +718,8 @@ final class RecordingPanel {
             guard !self.compactHidden else { return }   // dictation still runs, it just draws nothing
             if self.compactWin == nil { self.buildCompact() }
             guard let win = self.compactWin else { return }
+            self.compactLevelBars?.layer?.removeAnimation(forKey: "pulse"); self.compactLevelBars?.layer?.opacity = 1
+            self.compactLockDot?.isHidden = !self.lockedNow
             self.compactIdleBar?.isHidden = true
             self.compactLevelBars?.isHidden = false; self.compactLevelBars?.reset()
             self.layoutCompactPill(Self.compactSize, animated: true)   // grows on dictation

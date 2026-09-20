@@ -100,7 +100,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // may have already stopped this same recording — without it, this would stop a
                 // second time.
                 if wasHold && self.isRecording { self.stopAndTranscribe() }
-                // else: quick click that started it -> tap-on, keep recording (mirrors TAP-on)
+                else if self.isRecording { self.panel.setLocked(true) }   // quick click that started it -> tap-on (mirrors TAP-on)
             } else if self.isRecording {
                 self.stopAndTranscribe()                  // click while already recording -> tap-off
             }
@@ -174,6 +174,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let indicatorItem = NSMenuItem(title: "Floating Indicator", action: #selector(toggleCompactIndicator(_:)), keyEquivalent: "")
         indicatorItem.state = (cfg.compactHidden ?? false) ? .off : .on
         menu.addItem(indicatorItem)
+        // Microphone: the Flow-Bar-style device picker. System default stays the default; a pick
+        // pins that device through the HAL capture path (AirPods rule still applies on top).
+        let micMenu = NSMenu()
+        let current = cfg.inputDeviceUID ?? ""
+        let sys = NSMenuItem(title: "System Default", action: #selector(pickMicrophone(_:)), keyEquivalent: "")
+        sys.representedObject = ""; sys.state = current.isEmpty ? .on : .off; sys.target = self
+        micMenu.addItem(sys)
+        micMenu.addItem(NSMenuItem.separator())
+        for dev in InputDevice.allInputs() {
+            let it = NSMenuItem(title: dev.name, action: #selector(pickMicrophone(_:)), keyEquivalent: "")
+            it.representedObject = dev.uid; it.state = dev.uid == current ? .on : .off; it.target = self
+            micMenu.addItem(it)
+        }
+        let micItem = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
+        micItem.submenu = micMenu
+        menu.addItem(micItem)
         menu.addItem(NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: ""))
@@ -270,6 +286,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    @objc func pickMicrophone(_ sender: NSMenuItem) {
+        let uid = (sender.representedObject as? String) ?? ""
+        cfg.inputDeviceUID = uid.isEmpty ? nil : uid
+        cfg.save()
+        statusItem.menu = buildMainMenu()
+        wlog("microphone pick -> \(uid.isEmpty ? "system default" : sender.title)")
     }
 
     @objc func openHub() {
@@ -381,6 +405,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         } else if !wasHold {
                             // Quick tap that started recording -> stay recording (toggle-on).
                             wlog("TAP-on (\(heldNs/1_000_000)ms) -> keep recording")
+                            delegate.panel.setLocked(true)
                         }
                     } else if delegate.isRecording {
                         // Recording was already running from a previous tap; any release now = tap-off.
@@ -480,6 +505,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             panel.setPartial("⚠︎ Secure input is on — Enter won't work. Lock the screen (⌃⌘Q) and log back in.")
         }
         recorder.avoidBluetoothMic = cfg.avoidBluetoothMic ?? true
+        recorder.pinnedDeviceUID = cfg.inputDeviceUID
+        panel.setLocked(false)
         recorder.start()
         // Live preview is OFF by default — it runs a second whisper process during recording,
         // which competes for compute. Only start it when explicitly enabled, and use a FAST model.
@@ -694,7 +721,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 wlog("qwen engine UNAVAILABLE — no transcript produced")
                 DispatchQueue.main.async {
                     if !self.isRecording { self.setStatusIcon("exclamationmark.triangle", tint: .systemRed) }
-                    self.panel.hide()
+                    self.panel.setError("Speech engine unavailable")
                     if submit { self.postEnter("forwarded — ASR engine down") }
                 }
                 return

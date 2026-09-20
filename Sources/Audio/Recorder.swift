@@ -14,6 +14,7 @@ class AudioRecorder {
     private var engine: AVAudioEngine?
     private var configObserver: NSObjectProtocol?
     var avoidBluetoothMic = true   // set from Config before start()
+    var pinnedDeviceUID: String? = nil   // set from Config before start()
     private var hal: HALCapture?      // pinned-device path; engine stays nil while this is live
     private var audioFile: AVAudioFile?
     private var converter: AVAudioConverter?
@@ -33,7 +34,7 @@ class AudioRecorder {
         try? FileManager.default.removeItem(at: outputURL)
         floorDb = .nan; loggedBufferSize = false
         teardownEngine()
-        if let dev = InputDevice.preferred(avoidBluetooth: avoidBluetoothMic) {
+        if let dev = InputDevice.preferred(avoidBluetooth: avoidBluetoothMic, pinnedUID: pinnedDeviceUID) {
             // Pinned path: never instantiate AVAudioEngine.inputNode (it opens the default device).
             guard let cap = HALCapture(device: dev, handler: { [weak self] buf in self?.consume(buf) }),
                   let fmt = cap.format else { wlog("recorder ABORT — HAL capture unavailable"); return }

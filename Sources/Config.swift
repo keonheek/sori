@@ -44,6 +44,7 @@ struct Config: Codable {
     // which pauses whatever is playing and costs ~1s per switch, each way, on every press.
     // Default ON; set false to dictate through the earbuds' mic anyway. (2026-09-20)
     var avoidBluetoothMic: Bool? = nil
+    var inputDeviceUID: String? = nil      // Microphone menu pick (empty/nil = system default)
     // Eval capture: copy every finished recording into this directory (absolute path) before
     // transcription deletes it. Off when nil. Used with tests/eval/personal/capture.sh. (2026-09-20)
     var keepRecordingsDir: String? = nil

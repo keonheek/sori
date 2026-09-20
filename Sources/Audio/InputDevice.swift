@@ -9,7 +9,7 @@ import IOKit.hid
 // (leave AVAudioEngine alone). Returns the built-in mic when the default input is
 // Bluetooth and avoidBluetoothMic is on, so AirPods stay on A2DP and never pause.
 enum InputDevice {
-    struct Info { let id: AudioDeviceID; let name: String; let transport: UInt32 }
+    struct Info { let id: AudioDeviceID; let name: String; let transport: UInt32; let uid: String }
 
     private static func prop(_ sel: AudioObjectPropertySelector, scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> AudioObjectPropertyAddress {
         AudioObjectPropertyAddress(mSelector: sel, mScope: scope, mElement: kAudioObjectPropertyElementMain)
@@ -34,8 +34,22 @@ enum InputDevice {
         let abl = UnsafeMutableAudioBufferListPointer(buf.assumingMemoryBound(to: AudioBufferList.self))
         return abl.reduce(0) { $0 + Int($1.mNumberChannels) }
     }
+    private static func uid(_ dev: AudioDeviceID) -> String {
+        var a = prop(kAudioDevicePropertyDeviceUID); var v: CFString = "" as CFString
+        var sz = UInt32(MemoryLayout<CFString>.size)
+        let st = withUnsafeMutablePointer(to: &v) { AudioObjectGetPropertyData(dev, &a, 0, nil, &sz, $0) }
+        return st == noErr ? (v as String) : ""
+    }
     static func info(_ dev: AudioDeviceID) -> Info {
-        Info(id: dev, name: name(dev), transport: u32(dev, kAudioDevicePropertyTransportType) ?? 0)
+        Info(id: dev, name: name(dev), transport: u32(dev, kAudioDevicePropertyTransportType) ?? 0, uid: uid(dev))
+    }
+    // Every device with input channels, in CoreAudio order (the Microphone submenu).
+    static func allInputs() -> [Info] {
+        var a = prop(kAudioHardwarePropertyDevices); var sz: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &sz) == noErr else { return [] }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(sz) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &sz, &ids) == noErr else { return [] }
+        return ids.filter { inputChannels($0) > 0 }.map(info)
     }
     static func isBluetooth(_ t: UInt32) -> Bool {
         t == kAudioDeviceTransportTypeBluetooth || t == kAudioDeviceTransportTypeBluetoothLE
@@ -55,8 +69,18 @@ enum InputDevice {
         return nil
     }
     // The device the recorder should pin, or nil to use the default. Logs the decision.
-    static func preferred(avoidBluetooth: Bool) -> Info? {
+    static func preferred(avoidBluetooth: Bool, pinnedUID: String? = nil) -> Info? {
         let t0 = DispatchTime.now().uptimeNanoseconds
+        // An explicit pick from the Microphone menu wins. Pinning the device that already IS the
+        // system default is a no-op (engine path), so unplugging it falls back cleanly.
+        if let uid = pinnedUID, !uid.isEmpty {
+            if let dev = allInputs().first(where: { $0.uid == uid }) {
+                if dev.id == systemDefault()?.id, !(avoidBluetooth && isBluetooth(dev.transport)) { return nil }
+                wlog("capturing from pinned input '\(dev.name)'")
+                return dev
+            }
+            wlog("pinned input \(uid) not present — using the system default")
+        }
         guard avoidBluetooth, let def = systemDefault(), isBluetooth(def.transport) else { return nil }
         let t1 = DispatchTime.now().uptimeNanoseconds
         guard let mic = builtInMic() else {
