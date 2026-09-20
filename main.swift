@@ -814,22 +814,85 @@ enum InputDevice {
         wlog("default input '\(def.name)' is Bluetooth — capturing from '\(mic.name)' so it stays on A2DP")
         return mic
     }
-    // Pin an engine's input unit to a device. Must run BEFORE inputFormat is read or the
-    // engine starts; the HAL input unit only honours CurrentDevice while uninitialised.
-    @discardableResult
-    static func pin(_ engine: AVAudioEngine, to dev: Info) -> Bool {
-        guard let unit = engine.inputNode.audioUnit else { wlog("pin: inputNode has no audioUnit"); return false }
-        var id = dev.id
-        let st = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
-                                      &id, UInt32(MemoryLayout<AudioDeviceID>.size))
-        if st != noErr { wlog("pin to '\(dev.name)' FAILED: \(st)"); return false }
-        // Read it back: the engine's own view is the evidence, not the set call's return.
-        var got: AudioDeviceID = 0; var sz = UInt32(MemoryLayout<AudioDeviceID>.size)
-        if AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &got, &sz) == noErr {
-            wlog("capture device now '\(name(got))'" + (got == dev.id ? "" : " — MISMATCH, wanted '\(dev.name)'"))
-        }
-        return got == dev.id
+}
+
+// MARK: - Direct AUHAL capture on a chosen device
+// AVAudioEngine.inputNode instantiates its I/O unit on the DEFAULT input before any pin
+// can be applied, and with AirPods that instant is enough to trip the A2DP→HFP switch
+// (his report 2026-09-20: 0.5s dip on press even after pinning). Building the HAL output
+// unit by hand lets CurrentDevice be set BEFORE AudioUnitInitialize, so the Bluetooth
+// device is never touched at all.
+final class HALCapture {
+    private var unit: AudioUnit?
+    private(set) var format: AVAudioFormat?
+    private let handler: (AVAudioPCMBuffer) -> Void
+
+    init?(device: InputDevice.Info, handler: @escaping (AVAudioPCMBuffer) -> Void) {
+        self.handler = handler
+        var desc = AudioComponentDescription(componentType: kAudioUnitType_Output,
+                                             componentSubType: kAudioUnitSubType_HALOutput,
+                                             componentManufacturer: kAudioUnitManufacturer_Apple,
+                                             componentFlags: 0, componentFlagsMask: 0)
+        guard let comp = AudioComponentFindNext(nil, &desc) else { wlog("HAL: no AUHAL component"); return nil }
+        var u: AudioUnit?
+        guard AudioComponentInstanceNew(comp, &u) == noErr, let unit = u else { wlog("HAL: instance FAILED"); return nil }
+        self.unit = unit
+        var on: UInt32 = 1, off: UInt32 = 0
+        let sz = UInt32(MemoryLayout<UInt32>.size)
+        // Input on element 1, output off on element 0 — order matters: EnableIO before CurrentDevice.
+        guard AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &on, sz) == noErr,
+              AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &off, sz) == noErr
+        else { wlog("HAL: EnableIO FAILED"); dispose(); return nil }
+        var dev = device.id
+        guard AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                                   &dev, UInt32(MemoryLayout<AudioDeviceID>.size)) == noErr
+        else { wlog("HAL: CurrentDevice '\(device.name)' FAILED"); dispose(); return nil }
+        // Hardware format (input scope of element 1) → ask for float32 deinterleaved at the
+        // same rate/channels on the output side of the input element.
+        var hw = AudioStreamBasicDescription(); var hsz = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        guard AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &hw, &hsz) == noErr,
+              hw.mSampleRate > 0,
+              let fmt = AVAudioFormat(standardFormatWithSampleRate: hw.mSampleRate, channels: max(1, hw.mChannelsPerFrame))
+        else { wlog("HAL: hardware format unreadable"); dispose(); return nil }
+        var client = fmt.streamDescription.pointee
+        guard AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &client,
+                                   UInt32(MemoryLayout<AudioStreamBasicDescription>.size)) == noErr
+        else { wlog("HAL: client format FAILED"); dispose(); return nil }
+        format = fmt
+        var cb = AURenderCallbackStruct(inputProc: { refCon, flags, ts, bus, frames, _ in
+            let me = Unmanaged<HALCapture>.fromOpaque(refCon).takeUnretainedValue()
+            return me.render(flags: flags, ts: ts, bus: bus, frames: frames)
+        }, inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
+        guard AudioUnitSetProperty(unit, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0,
+                                   &cb, UInt32(MemoryLayout<AURenderCallbackStruct>.size)) == noErr
+        else { wlog("HAL: callback FAILED"); dispose(); return nil }
+        guard AudioUnitInitialize(unit) == noErr else { wlog("HAL: initialize FAILED"); dispose(); return nil }
+        wlog("HAL capture on '\(device.name)' sr=\(fmt.sampleRate) ch=\(fmt.channelCount)")
     }
+
+    private func render(flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>, ts: UnsafePointer<AudioTimeStamp>,
+                        bus: UInt32, frames: UInt32) -> OSStatus {
+        guard let unit, let fmt = format, let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frames) else { return noErr }
+        buf.frameLength = frames
+        let st = AudioUnitRender(unit, flags, ts, bus, frames, buf.mutableAudioBufferList)
+        if st == noErr { handler(buf) }
+        return st
+    }
+
+    func start() -> Bool {
+        guard let unit else { return false }
+        let st = AudioOutputUnitStart(unit)
+        if st != noErr { wlog("HAL: start FAILED \(st)") }
+        return st == noErr
+    }
+    func stop() {
+        guard let unit else { return }
+        AudioOutputUnitStop(unit); AudioUnitUninitialize(unit); dispose()
+    }
+    private func dispose() {
+        if let u = unit { AudioComponentInstanceDispose(u); unit = nil }
+    }
+    deinit { stop() }
 }
 
 // MARK: - Recorder (16k mono PCM, live level metering)
@@ -842,6 +905,7 @@ class AudioRecorder {
     private var engine: AVAudioEngine?
     private var configObserver: NSObjectProtocol?
     var avoidBluetoothMic = true   // set from Config before start()
+    private var hal: HALCapture?      // pinned-device path; engine stays nil while this is live
     private var audioFile: AVAudioFile?
     private var converter: AVAudioConverter?
     private let outputURL = URL(fileURLWithPath: workPath("sori.wav"))
@@ -860,21 +924,57 @@ class AudioRecorder {
         try? FileManager.default.removeItem(at: outputURL)
         floorDb = .nan; loggedBufferSize = false
         teardownEngine()
+        if let dev = InputDevice.preferred(avoidBluetooth: avoidBluetoothMic) {
+            // Pinned path: never instantiate AVAudioEngine.inputNode (it opens the default device).
+            guard let cap = HALCapture(device: dev, handler: { [weak self] buf in self?.consume(buf) }),
+                  let fmt = cap.format else { wlog("recorder ABORT — HAL capture unavailable"); return }
+            guard openFile() else { return }
+            converter = AVAudioConverter(from: fmt, to: targetFormat)
+            hal = cap
+            if cap.start() { wlog("HAL started") } else { hal = nil; audioFile = nil }
+            return
+        }
         let engine = AVAudioEngine()
         self.engine = engine
-        if let dev = InputDevice.preferred(avoidBluetooth: avoidBluetoothMic) { InputDevice.pin(engine, to: dev) }
         let inFormat = engine.inputNode.inputFormat(forBus: 0)
         wlog("recorder.start sr=\(inFormat.sampleRate) ch=\(inFormat.channelCount)")
         guard inFormat.sampleRate > 0 else {
             wlog("recorder ABORT — bad format (mic denied?)"); self.engine = nil; return
         }
-        do {
-            audioFile = try AVAudioFile(forWriting: outputURL, settings: targetFormat.settings,
-                                        commonFormat: .pcmFormatInt16, interleaved: true)
-        } catch { wlog("AVAudioFile FAILED: \(error)"); self.engine = nil; return }
+        guard openFile() else { self.engine = nil; return }
         installRecordingTap(on: engine)
         observeConfigChange(engine)
         do { try engine.start(); wlog("engine started") } catch { wlog("engine.start FAILED: \(error)") }
+    }
+
+    private func openFile() -> Bool {
+        do {
+            audioFile = try AVAudioFile(forWriting: outputURL, settings: targetFormat.settings,
+                                        commonFormat: .pcmFormatInt16, interleaved: true)
+            return true
+        } catch { wlog("AVAudioFile FAILED: \(error)"); return false }
+    }
+
+    // Shared per-buffer work for both capture paths: level meter + 16k mono conversion + write.
+    private func consume(_ buf: AVAudioPCMBuffer) {
+        lastBufferAt = Date().timeIntervalSince1970
+        if !loggedBufferSize { loggedBufferSize = true; wlog("tap buffer frames=\(buf.frameLength)") }
+        if let ch = buf.floatChannelData?[0] {
+            let n = Int(buf.frameLength); var sum: Float = 0
+            for i in 0..<n { sum += ch[i] * ch[i] }
+            let rms = n > 0 ? sqrtf(sum / Float(n)) : 0
+            onLevel?(displayLevel(rms))
+        }
+        guard let conv = converter, let file = audioFile else { return }
+        let ratio = targetFormat.sampleRate / buf.format.sampleRate
+        let outCap = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 1024
+        guard let outBuf = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCap) else { return }
+        var fed = false; var err: NSError?
+        conv.convert(to: outBuf, error: &err) { _, status in
+            if fed { status.pointee = .noDataNow; return nil }
+            fed = true; status.pointee = .haveData; return buf
+        }
+        if outBuf.frameLength > 0 { try? file.write(from: outBuf) }
     }
 
     // Tap + converter for the engine's CURRENT input format. The removeTap first is
@@ -886,25 +986,7 @@ class AudioRecorder {
         let inFormat = input.inputFormat(forBus: 0)
         converter = AVAudioConverter(from: inFormat, to: targetFormat)
         input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { [weak self] buf, _ in
-            guard let self else { return }
-            self.lastBufferAt = Date().timeIntervalSince1970
-            if !self.loggedBufferSize { self.loggedBufferSize = true; wlog("tap buffer frames=\(buf.frameLength)") }
-            if let ch = buf.floatChannelData?[0] {
-                let n = Int(buf.frameLength); var sum: Float = 0
-                for i in 0..<n { sum += ch[i] * ch[i] }
-                let rms = n > 0 ? sqrtf(sum / Float(n)) : 0
-                self.onLevel?(self.displayLevel(rms))
-            }
-            guard let conv = self.converter, let file = self.audioFile else { return }
-            let ratio = self.targetFormat.sampleRate / inFormat.sampleRate
-            let outCap = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 1024
-            guard let outBuf = AVAudioPCMBuffer(pcmFormat: self.targetFormat, frameCapacity: outCap) else { return }
-            var fed = false; var err: NSError?
-            conv.convert(to: outBuf, error: &err) { _, status in
-                if fed { status.pointee = .noDataNow; return nil }
-                fed = true; status.pointee = .haveData; return buf
-            }
-            if outBuf.frameLength > 0 { try? file.write(from: outBuf) }
+            self?.consume(buf)
         }
     }
 
@@ -945,7 +1027,6 @@ class AudioRecorder {
         // Reusing a stopped engine after a device swap is unreliable — start clean.
         let fresh = AVAudioEngine()
         engine = fresh
-        if let dev = InputDevice.preferred(avoidBluetooth: avoidBluetoothMic) { InputDevice.pin(fresh, to: dev) }
         let sr = fresh.inputNode.inputFormat(forBus: 0).sampleRate
         guard sr > 0 else { wlog("route change: no usable input — recording stalled"); return }
         installRecordingTap(on: fresh)
@@ -958,6 +1039,7 @@ class AudioRecorder {
     // tap on 2026-08-10 (a route change had already stopped the engine). removeTap with no
     // tap installed is a safe no-op (harness-verified).
     private func teardownEngine() {
+        if let h = hal { h.stop(); hal = nil }
         if let o = configObserver { NotificationCenter.default.removeObserver(o); configObserver = nil }
         if let e = engine {
             e.inputNode.removeTap(onBus: 0)
@@ -2460,11 +2542,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Mic-conflict / bad-route detection: returns a warning string if the input device
     // looks unusable (no device, or a low-quality Bluetooth HFP call route), else nil.
     func micWarning() -> String? {
+        // Capture is pinned to the built-in mic, so the Bluetooth default's route is irrelevant.
+        // This check runs FIRST: AVCaptureDevice.default(for: .audio) touches the default
+        // device, and on AirPods that alone was enough to trip the HFP switch on every press
+        // (his report 2026-09-20: 0.5s of silence on press, none on release).
+        if InputDevice.preferred(avoidBluetooth: cfg.avoidBluetoothMic ?? true) != nil { return nil }
         guard let dev = AVCaptureDevice.default(for: .audio) else {
             return "No microphone found"
         }
-        // Capture is pinned to the built-in mic, so the Bluetooth default's route is irrelevant.
-        if InputDevice.preferred(avoidBluetooth: cfg.avoidBluetoothMic ?? true) != nil { return nil }
         // Bluetooth devices in call/HFP mode report a very low sample rate (8–16kHz) and
         // produce garbage transcription. Detect via the active format's sample rate.
         let sr = dev.activeFormat.formatDescription.audioStreamBasicDescription?.mSampleRate ?? 48000
