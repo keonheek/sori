@@ -53,6 +53,16 @@ if let i = CommandLine.arguments.firstIndex(of: "--onboard-snapshot"), i + 1 < C
     let ok = MainActor.assumeIsolated { OnboardingController.snapshot(to: CommandLine.arguments[i + 1]) }
     print(ok ? "wrote \(CommandLine.arguments[i + 1])" : "snapshot FAILED"); exit(ok ? 0 : 1)
 }
+// Command Mode check without audio: --command-test "<instruction>" ["<selection>"]
+if let i = CommandLine.arguments.firstIndex(of: "--command-test"), i + 1 < CommandLine.arguments.count {
+    let sel = i + 2 < CommandLine.arguments.count ? CommandLine.arguments[i + 2] : nil
+    switch CommandMode.run(instruction: CommandLine.arguments[i + 1], selection: sel) {
+    case .replace(let t): print("REPLACE: \(t)")
+    case .openURL(let u): print("OPEN: \(u)")
+    case .refused(let w): print("REFUSED: \(w)")
+    }
+    exit(0)
+}
 // Headless Hub render for review: never orders a window front, no dock icon, exits when written.
 if let i = CommandLine.arguments.firstIndex(of: "--hub-snapshot"), i + 1 < CommandLine.arguments.count {
     let snapApp = NSApplication.shared

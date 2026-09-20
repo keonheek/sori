@@ -31,6 +31,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var cmdDownTimeNs: UInt64 = 0      // CGEvent.timestamp of the right ⌘ down (ns since boot)
     var startedThisPress = false        // did this ⌘-press start a recording?
     var submitAfterPaste = false        // set when Enter ended the recording — auto-press Enter after paste
+    var commandModeArmed = false        // Right ⌥ pressed while Right ⌘ held → this recording is an instruction
     // Short press (< 400ms) = TAP: start now, keep recording, next tap stops.
     // Longer press (>= 400ms) = HOLD: recording stops the moment you let go.
     let holdThresholdNs: UInt64 = 400_000_000  // 400ms
@@ -440,6 +441,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     delegate.noteChord()
                     return Unmanaged.passRetained(event)
                 }
+                // Right ⌥ (61) while Right ⌘ is held = Command Mode for this recording (Experimental).
+                if keycode == 61 && delegate.rightCmdDown && delegate.isRecording && (delegate.cfg.commandMode ?? false) {
+                    if event.flags.contains(.maskAlternate) && !delegate.commandModeArmed {
+                        delegate.commandModeArmed = true
+                        delegate.panel.setCommandMode(true)
+                        wlog("command mode ARMED")
+                    }
+                    return nil   // never let the ⌥ chord reach the app
+                }
                 guard keycode == 54 else {
                     delegate.noteChord()
                     return Unmanaged.passRetained(event)
@@ -468,7 +478,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     guard clean else { return Unmanaged.passRetained(event) }
                     let heldNs = event.timestamp &- delegate.cmdDownTimeNs
                     let wasHold = heldNs >= delegate.holdThresholdNs
-                    if delegate.startedThisPress {
+                    if delegate.commandModeArmed && delegate.isRecording {
+                        wlog("command mode release -> stop+run")
+                        delegate.stopAndTranscribe()
+                    } else if delegate.startedThisPress {
                         // This press started the recording.
                         if wasHold && delegate.isRecording {
                             wlog("HOLD release (\(heldNs/1_000_000)ms) -> stop")
@@ -578,6 +591,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         recorder.avoidBluetoothMic = cfg.avoidBluetoothMic ?? true
         recorder.pinnedDeviceUID = cfg.inputDeviceUID
         panel.setLocked(false)
+        commandModeArmed = false
         recorder.start()
         // Live preview is OFF by default — it runs a second whisper process during recording,
         // which competes for compute. Only start it when explicitly enabled, and use a FAST model.
@@ -697,6 +711,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         submitAfterPaste = false
         // Read the target app NOW (main thread, before any async hop): this is where he is typing.
         let context = AppContext.capture()
+        let asCommand = commandModeArmed
+        commandModeArmed = false
+        let selection = asCommand ? CommandMode.selectedText() : nil
+        if asCommand { wlog("command mode: selection \(selection.map { "\($0.count) chars" } ?? "none")") }
         recorder.stop { url in
             // Move the WAV to a unique path BEFORE queueing: a new recording restarts
             // /tmp/sori.wav immediately, which would clobber the file while a
@@ -711,7 +729,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 catch { wlog("keep FAILED: \(error)") }
             }
             self.transcribeQueue.async {
-                self.transcribe(url: URL(fileURLWithPath: unique), cfg: cfg, submit: submit, context: context)
+                if asCommand { self.runCommand(url: URL(fileURLWithPath: unique), cfg: cfg, selection: selection) }
+                else { self.transcribe(url: URL(fileURLWithPath: unique), cfg: cfg, submit: submit, context: context) }
                 try? FileManager.default.removeItem(atPath: unique)
             }
         }
@@ -731,6 +750,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // prompt (Korean detected as English and TRANSLATED, 2026-07-22). Qwen3-ASR
     // takes no style prompt and does its own language ID over 52 languages, so
     // the pre-pass, the ggml-base model, and that failure mode are all gone.
+
+    // Command Mode: transcribe the instruction, apply it to the selection (or hand off to the web).
+    private func runCommand(url: URL, cfg: Config, selection: String?) {
+        defer { DispatchQueue.main.async { self.panel.setCommandMode(false) } }
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        QwenServer.ensureRunning(modelPath: cfg.asrModel ?? QwenServer.defaultRepo)
+        var instruction: String? = nil
+        if (cfg.asrProvider ?? "local") == "openai", QwenServer.hasSpeech(wav: url.path) != false {
+            instruction = OpenAITranscribe.transcribe(wav: url.path, model: cfg.asrCloudModel ?? "gpt-transcribe", prompt: "")
+        }
+        if instruction == nil { instruction = QwenServer.transcribe(wav: url.path, lang: cfg.lang == "auto" ? "" : cfg.lang) }
+        let inst = (instruction ?? "").replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        wlog("command instruction=\"\(inst)\"")
+        let outcome = CommandMode.run(instruction: inst, selection: selection)
+        DispatchQueue.main.async {
+            if !self.isRecording { self.setStatusIcon("mic"); self.panel.hide() }
+            switch outcome {
+            case .replace(let text):
+                // The selection is still highlighted in the target app; ⌘V replaces it.
+                let pb = NSPasteboard.general
+                pb.declareTypes([.string], owner: nil); pb.setString(text, forType: .string)
+                let src = wpttEventSource()
+                let down = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: true)
+                let up = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)
+                down?.flags = .maskCommand; up?.flags = .maskCommand
+                down?.post(tap: .cgAnnotatedSessionEventTap); up?.post(tap: .cgAnnotatedSessionEventTap)
+                self.lastPaste = LastPaste(pasted: text, final: text, raw: selection ?? "", at: Date(), showingRaw: false)
+                wlog("command: replaced selection (\(text.count) chars)")
+            case .openURL(let u):
+                wlog("command: open \(u.absoluteString.prefix(80))")
+                NSWorkspace.shared.open(u)
+            case .refused(let why):
+                wlog("command REFUSED: \(why)")
+                self.panel.setError(why)
+            }
+        }
+    }
 
     private func transcribe(url: URL, cfg: Config, submit: Bool, context: AppContext) {
             let tStart = Date()

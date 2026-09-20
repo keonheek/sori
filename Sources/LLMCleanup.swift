@@ -281,7 +281,7 @@ Examples (input => output):
         return cleaned
     }
 
-    private static func apiKey() -> String? {
+    static func apiKey() -> String? {
         if let env = ProcessInfo.processInfo.environment["GROQ_API_KEY"], !env.isEmpty { return env }
         let p = (NSHomeDirectory() as NSString).appendingPathComponent(".sori-groq")
         if let k = try? String(contentsOfFile: p, encoding: .utf8) {

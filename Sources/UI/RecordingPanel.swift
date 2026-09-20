@@ -283,6 +283,17 @@ final class RecordingPanel {
     }
     private var lockedNow = false
 
+    // Command Mode: the pill takes the accent while the instruction is being spoken/applied.
+    func setCommandMode(_ on: Bool) {
+        DispatchQueue.main.async {
+            if self.style == "compact" {
+                self.compactChip?.layer?.backgroundColor = on ? NSColor.systemBlue.withAlphaComponent(0.7).cgColor : Self.compactChipColor
+            } else if on {
+                self.setPartial("Command — say what to do with the selection")
+            }
+        }
+    }
+
     // Transient failure the user must see (engine down, no audio): the compact chip flashes red
     // for 1.6 s and returns to idle; classic shows the message in the panel.
     func setError(_ msg: String) {
