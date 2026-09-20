@@ -437,15 +437,28 @@ Examples (input => output):
             return re.matches(in: s.lowercased(), range: NSRange(location: 0, length: ns.length)).map { ns.substring(with: $0.range) }
         }
         let inW = words(input), outW = words(cleaned)
-        var i = 0
+        // Align, and classify every dropped word: a known filler or an immediate repeat of a
+        // neighbour (stutter) is a legitimate deletion; anything else is "content".
+        let fillers: Set<String> = ["um", "uh", "er", "ah", "hmm", "like", "basically", "actually", "you", "know", "i", "mean",
+                                    "so", "okay", "ok", "well", "음", "어", "그", "저기", "뭐냐", "뭐", "그냥", "이제", "막", "약간"]
+        var i = 0, contentDrops = 0
+        func dropped(_ k: Int) {
+            let w = inW[k]
+            let repeatOf = (k > 0 && inW[k - 1] == w) || (k + 1 < inW.count && inW[k + 1] == w)
+            if !fillers.contains(w) && !repeatOf { contentDrops += 1 }
+        }
         for w in outW {
-            while i < inW.count, inW[i] != w { i += 1 }
+            while i < inW.count, inW[i] != w { dropped(i); i += 1 }
             if i == inW.count { wlog("LLM cleanup REJECTED (not a subsequence: \"\(w)\")"); return nil }
             i += 1
         }
-        // Deleting more than 40% of the words is not disfluency removal.
-        if inW.count >= 5, Double(outW.count) < 0.6 * Double(inW.count) {
-            wlog("LLM cleanup REJECTED (dropped \(inW.count - outW.count)/\(inW.count) words)"); return nil
+        while i < inW.count { dropped(i); i += 1 }
+        // Deleting more than 40% of the CONTENT words is not disfluency removal. Fillers and
+        // stutters are free: the old flat 40% floor rejected "어 그 SDIC 공지는 어 오늘 오늘 올릴게요"
+        // -> "SDIC 공지는 오늘 올릴게요" (4/8 dropped, all fillers), the prompt's own example, so
+        // filler-heavy Korean dictation was pasting raw (mutation test 2026-09-20).
+        if inW.count >= 5, Double(contentDrops) > 0.4 * Double(inW.count) {
+            wlog("LLM cleanup REJECTED (dropped \(contentDrops) content words of \(inW.count))"); return nil
         }
         return cleaned
     }
