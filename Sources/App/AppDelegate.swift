@@ -24,6 +24,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let panel = RecordingPanel()
     var cfg = Config.load()
     var settings: SettingsController?
+    var hub: HubController?
 
     var rightCmdDown = false
     var otherKeyDuringCmd = false
@@ -157,6 +158,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Tap Right ⌘ to start / stop", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Open Sori Hub", action: #selector(openHub), keyEquivalent: "h"))
+        let lastItem = NSMenuItem(title: "Paste Last Transcript", action: #selector(pasteLastTranscript), keyEquivalent: "")
+        lastItem.isEnabled = DictationRepo.last() != nil
+        menu.addItem(lastItem)
+        menu.addItem(NSMenuItem.separator())
         let cleanupItem = NSMenuItem(title: "Filler Cleanup (Groq)", action: #selector(toggleLLMCleanup(_:)), keyEquivalent: "")
         cleanupItem.state = (cfg.llmCleanup ?? false) ? .on : .off
         menu.addItem(cleanupItem)
@@ -264,6 +270,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    @objc func openHub() {
+        if hub == nil { hub = HubController() }
+        hub?.show()
+        wlog("hub opened")
+    }
+
+    // From the menu bar / indicator menu: the target app keeps focus (the status menu and the
+    // .nonactivatingPanel never take it), so the paste lands where the caret is.
+    @objc func pasteLastTranscript() {
+        guard let d = DictationRepo.last() else { return }
+        wlog("paste last transcript (#\(d.id))")
+        paste(d.final, submit: false, dictationId: nil)
     }
 
     @objc func openSettings() {
@@ -615,6 +635,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // the pre-pass, the ggml-base model, and that failure mode are all gone.
 
     private func transcribe(url: URL, cfg: Config, submit: Bool, context: AppContext) {
+            let tStart = Date()
+            var asrMs = 0, rewriteMs = 0
+            let wavBytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+            let audioMs = wavBytes > 44 ? (wavBytes - 44) / 32 : 0   // 16 kHz mono int16
+            let keptPath: String = {
+                guard let dir = cfg.keepRecordingsDir, !dir.isEmpty else { return "" }
+                return (dir as NSString).appendingPathComponent(url.lastPathComponent)
+            }()
             let repo = cfg.asrModel ?? QwenServer.defaultRepo
             // Clear the previous output FIRST: a stale out.txt would paste the
             // PREVIOUS session's transcript again.
@@ -638,6 +666,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             QwenServer.ensureRunning(modelPath: repo)
             var text = ""
             var cloudText: String? = nil
+            let tAsr = Date()
+            var provider = "qwen"
             if (cfg.asrProvider ?? "local") == "openai" {
                 // Local VAD gate first (silence / short tap → no upload, no cost, no hallucination).
                 let gate = QwenServer.hasSpeech(wav: url.path)
@@ -652,6 +682,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             if let c = cloudText {
                 text = c
+                provider = "openai"
                 wlog("transcribed via openai")
             } else if let t = QwenServer.transcribe(wav: url.path, lang: lang, vocabulary: vocabulary) {
                 text = t
@@ -668,6 +699,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 return
             }
+            asrMs = Int(Date().timeIntervalSince(tAsr) * 1000)
             let raw = text
             // Whisper-era list, trimmed 2026-09-03: Qwen3-ASR returns "" on silence (every
             // blank recording in the log since the engine swap came back 0 chars), so the
@@ -744,6 +776,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // fillers to strip, and the ~1s Groq round-trip is pure latency there.
             let wordCount = text.split(whereSeparator: { $0.isWhitespace }).count
             var rewrote = false
+            let tRewrite = Date()
             if (cfg.smartRewrite ?? false) && wordCount >= 3 {
                 wlog("smart rewrite ctx: \(context.kind.rawValue) — \(context.summary)")
                 if let r = LLMCleanup.smartRewrite(text, context: context) { text = r; rewrote = true }
@@ -753,52 +786,69 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // A deleted leading filler ("Um, so ...") leaves a lowercase start; re-tidy.
                 if cfg.cleanupEnabled ?? true { text = TextCleanup.clean(text) }
             }
+            rewriteMs = Int(Date().timeIntervalSince(tRewrite) * 1000)
             wlog("raw=\"\(raw)\" -> final=\"\(text)\"")
+            // Every dictation that produced text is a row, pasted or not — Home, stats, undo and
+            // the eval set all read this one table.
+            let dictationId = DictationRepo.insert(.init(
+                ts: tStart, context: context, raw: raw, final: text, provider: provider,
+                audioMs: audioMs, asrMs: asrMs, rewriteMs: rewriteMs,
+                totalMs: Int(Date().timeIntervalSince(tStart) * 1000), audioPath: keptPath))
 
             DispatchQueue.main.async {
                 // Don't reset the icon / hide the panel if a NEW recording already started.
                 if !self.isRecording { self.setStatusIcon("mic"); self.panel.hide() }
                 if !text.isEmpty {
-                    // Consecutive-dictation spacing: back-to-back dictations pasted with no
-                    // separator ("sentence.Sentence"). If the previous paste ended in a
-                    // non-whitespace char recently, and this one starts with a word char,
-                    // prepend one space. (We can't read the focused field; recency is the
-                    // best available proxy for "appending to the same text".)
-                    if let lastEnd = self.lastPasteEnd,
-                       Date().timeIntervalSince(self.lastPasteAt) < 600,
-                       !lastEnd.isWhitespace,
-                       let first = text.first,
-                       first.isLetter || first.isNumber {
-                        text = " " + text
-                    }
-                    self.lastPasteEnd = text.last
-                    self.lastPasteAt = Date()
-                    // Text always stays on the clipboard afterwards, so ⌘V recovers it
-                    // if the auto-paste lands in the wrong place or gets cancelled.
-                    let pb = NSPasteboard.general
-                    pb.declareTypes([.string], owner: nil); pb.setString(text, forType: .string)
-                    let src = wpttEventSource()
-                    // ⌘V paste
-                    let down = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: true)
-                    let up = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)
-                    down?.flags = .maskCommand; up?.flags = .maskCommand
-                    down?.post(tap: .cgAnnotatedSessionEventTap); up?.post(tap: .cgAnnotatedSessionEventTap)
-                    wlog("pasted (clipboard retained for ⌘V recovery)")
-                    // Learn-from-edits: remember what we pasted; if the user soon copies a close
-                    // variant (an in-place correction), infer a replacement rule.
-                    if cfg.learnEdits ?? true { self.watchForCorrection(of: text) }
-                    // Press Enter to submit when: the global setting is on, OR the user
-                    // ended this recording by pressing Enter (which we consumed).
-                    let shouldSubmit = (cfg.pressEnter ?? false) || submit
-                    if shouldSubmit {
-                        // 0.3s: slow targets (browsers, Electron apps) need time to process
-                        // the ⌘V before the Return arrives, or the submit fires empty.
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                            self.postEnter("submit")
-                        }
-                    }
+                    let submitNow = (cfg.pressEnter ?? false) || submit
+                    self.paste(text, submit: submitNow, dictationId: dictationId, startedAt: tStart)
                 }
             }
+    }
+
+    // Puts `text` on the clipboard and posts ⌘V to the frontmost app. Shared by the dictation
+    // pipeline and "Paste Last Transcript". Main thread only.
+    func paste(_ input: String, submit: Bool, dictationId: Int64?, startedAt: Date? = nil) {
+        var text = input
+        // Consecutive-dictation spacing: back-to-back dictations pasted with no
+        // separator ("sentence.Sentence"). If the previous paste ended in a
+        // non-whitespace char recently, and this one starts with a word char,
+        // prepend one space. (We can't read the focused field; recency is the
+        // best available proxy for "appending to the same text".)
+        if let lastEnd = self.lastPasteEnd,
+           Date().timeIntervalSince(self.lastPasteAt) < 600,
+           !lastEnd.isWhitespace,
+           let first = text.first,
+           first.isLetter || first.isNumber {
+            text = " " + text
+        }
+        self.lastPasteEnd = text.last
+        self.lastPasteAt = Date()
+        // Text always stays on the clipboard afterwards, so ⌘V recovers it
+        // if the auto-paste lands in the wrong place or gets cancelled.
+        let pb = NSPasteboard.general
+        pb.declareTypes([.string], owner: nil); pb.setString(text, forType: .string)
+        let src = wpttEventSource()
+        // ⌘V paste
+        let down = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: true)
+        let up = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)
+        down?.flags = .maskCommand; up?.flags = .maskCommand
+        down?.post(tap: .cgAnnotatedSessionEventTap); up?.post(tap: .cgAnnotatedSessionEventTap)
+        wlog("pasted (clipboard retained for ⌘V recovery)")
+        if let id = dictationId {
+            DictationRepo.markPasted(id, totalMs: startedAt.map { Int(Date().timeIntervalSince($0) * 1000) })
+        }
+        // Learn-from-edits: remember what we pasted; if the user soon copies a close
+        // variant (an in-place correction), infer a replacement rule.
+        if cfg.learnEdits ?? true { self.watchForCorrection(of: text) }
+        // Press Enter to submit when: the global setting is on, OR the user
+        // ended this recording by pressing Enter (which we consumed).
+        if submit {
+            // 0.3s: slow targets (browsers, Electron apps) need time to process
+            // the ⌘V before the Return arrives, or the submit fires empty.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                self.postEnter("submit")
+            }
+        }
     }
 
     // Learn-from-edits: poll the pasteboard for ~20s after a paste. If the user selects
