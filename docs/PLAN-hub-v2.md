@@ -154,3 +154,28 @@ locally. Nothing pushed without his word.
    unless he says otherwise.
 3. Undo hotkey binding (Right ⌘ + Z proposed).
 4. macOS 13 minimum (drops Big Sur/Monterey support in the public repo).
+
+## 5. Status (2026-09-21 00:05, all local commits on ~/Dev/sori master, nothing pushed)
+
+P0–P7 shipped the night of 09-20 (he said "work on the plan. Upgrade" at 23:13), plus a second pass on
+his "it should feel snappier" (streaming on by default, on-screen context, spoken formatting commands,
+typed-over correction learning). Commits 4ddf427 → 520ebd4. Deployed to /Applications/Sori.app.
+
+| Phase | State | Gate evidence | Still on him |
+|---|---|---|---|
+| P0 split | done | non-blank lines identical; his 23:21 dictation clean | — |
+| P1 store + Home | done | 202 rows backfilled; headless Home render `build/hub-home.png` | taste check of the Hub |
+| P2 indicator | done, **deviated**: kept his tuned pill, added states + Microphone menu | code paths only | see each state live |
+| P3 Dictionary/Snippets | done | `--text-pass` correction/casing/snippet verified; 16 conf entries migrated | dictate a name 3/3 |
+| P4 Style/Undo | done | tone bench: 0/12 trap executions, 11/12 + 10/12 real kept | undo in TextEdit + Gmail |
+| P5 Settings/Setup | done (Settings now inside the Hub, AppKit window retired) | Setup render `build/onboarding.png` | fresh-bundle walkthrough |
+| P6 Command Mode | done, default OFF | `--command-test`: traps refused, edit + translate ok | real selection run |
+| P7 streaming | done, **default ON** since 00:00 | probe: gpt-transcribe 1.2 s, gpt-live-transcribe 0.5 s (6.9% CER) | ≤ 700 ms median on 10 real dictations (store `total_ms`) |
+
+Deploy routine now: check the log's last recording event is a stop, `launchctl kill SIGTERM`, copy,
+codesign, kickstart. Swapping the binary under a running process SIGKILLs it (Code Signature Invalid)
+and killed a 62 s dictation of his at 23:53:08 — recovered from `$TMPDIR/sori/sori.wav`.
+
+Open calls (his): §4 items 1–4 unchanged, plus: gpt-live-transcribe as default (speed vs accuracy),
+context awareness default (currently ON, sends field text to Groq), auto-paragraphing for long dictations
+(not built; explicit commands only).
