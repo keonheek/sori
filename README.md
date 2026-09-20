@@ -48,7 +48,7 @@ macOS will ask for Microphone, Accessibility, and Input Monitoring; all three ar
 
 **Check for Updates…** in the menu-bar menu compares your version against the latest release. What happens next depends on how you installed, and the difference is worth understanding once:
 
-- **Installed from source:** click **Update & Restart**. A Terminal window opens, pulls, rebuilds, re-signs with the same identity your install already uses, and restarts Sori. Nothing else to do — your permissions survive, and the models are left alone. If you've edited `main.swift`, it stops and tells you rather than clobbering your work.
+- **Installed from source:** click **Update & Restart**. A Terminal window opens, pulls, rebuilds, re-signs with the same identity your install already uses, and restarts Sori. Nothing else to do — your permissions survive, and the models are left alone. If you've edited anything under `Sources/`, it stops and tells you rather than clobbering your work.
 - **Installed from the prebuilt zip:** it points you at the release page. Replace the app in `/Applications`, then re-enable Sori under System Settings > Privacy & Security > **Accessibility** and **Input Monitoring**. macOS ties those two grants to the code signature, and an unnotarized build gets a new signature every time it's built, so it sees each download as a different app. Only a paid Apple Developer ID would avoid that, and Sori doesn't have one — so source installs are the smoother path if you update often.
 
 Either way, updating never re-downloads the models — `install.sh` skips any that are already in `~/.sori-models`.
@@ -105,7 +105,7 @@ macOS ties Accessibility/Input Monitoring grants to the code signature, and ad-h
 
 ## Requirements
 
-macOS 11+ (universal: Apple Silicon and Intel) · Xcode Command Line Tools · Homebrew · ~2 GB disk for models · ~1.7 GB RAM while the warm engine is loaded (`warmEngine: false` to go without)
+macOS 13+ (universal: Apple Silicon and Intel) · Xcode Command Line Tools · Homebrew · ~2 GB disk for models · ~1.7 GB RAM while the warm engine is loaded (`warmEngine: false` to go without)
 
 Built on [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) via [mlx-audio](https://github.com/Blaizzy/mlx-audio), with [whisper.cpp](https://github.com/ggml-org/whisper.cpp) still driving the live-preview partials. One Swift file plus a small Python engine server; no Xcode project.
 

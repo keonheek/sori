@@ -3,13 +3,14 @@
 # install.sh builds single-arch for the local machine; THIS is the distribution build.
 set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Same single source of truth install.sh uses: the `let soriVersion` line in main.swift.
-VERSION="$(sed -n 's/^let soriVersion = "\(.*\)"/\1/p' "$SRC/main.swift")"
-[ -n "$VERSION" ] || { echo "ERROR: could not read soriVersion from main.swift"; exit 1; }
+# Same single source of truth install.sh uses: the `let soriVersion` line in Sources/Updater.swift.
+VERSION="$(sed -n 's/^let soriVersion = "\(.*\)"/\1/p' "$SRC/Sources/Updater.swift")"
+[ -n "$VERSION" ] || { echo "ERROR: could not read soriVersion from Sources/Updater.swift"; exit 1; }
 echo "-- Building Sori $VERSION"
 
-swiftc -O -target arm64-apple-macos11.0 main.swift -o /tmp/sori-arm64
-swiftc -O -target x86_64-apple-macos11.0 main.swift -o /tmp/sori-x86_64
+SOURCES=$(find "$SRC/Sources" -name "*.swift")
+swiftc -O -target arm64-apple-macos13.0 $SOURCES -o /tmp/sori-arm64
+swiftc -O -target x86_64-apple-macos13.0 $SOURCES -o /tmp/sori-x86_64
 lipo -create /tmp/sori-arm64 /tmp/sori-x86_64 -output build/Sori.app/Contents/MacOS/Sori
 rm -f /tmp/sori-arm64 /tmp/sori-x86_64
 

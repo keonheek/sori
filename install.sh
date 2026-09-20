@@ -7,9 +7,9 @@ MODELS="$HOME/.sori-models"
 LABEL="dev.sori.app"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Single source of truth for the version: the `let soriVersion` line in main.swift.
-VERSION="$(sed -n 's/^let soriVersion = "\(.*\)"/\1/p' "$SRC/main.swift")"
-[ -n "$VERSION" ] || { echo "ERROR: could not read soriVersion from main.swift"; exit 1; }
+# Single source of truth for the version: the `let soriVersion` line in Sources/Updater.swift.
+VERSION="$(sed -n 's/^let soriVersion = "\(.*\)"/\1/p' "$SRC/Sources/Updater.swift")"
+[ -n "$VERSION" ] || { echo "ERROR: could not read soriVersion from Sources/Updater.swift"; exit 1; }
 
 echo "== Sori installer =="
 
@@ -57,7 +57,7 @@ dl ggml-base.bin
 
 # 3. Build
 echo "-- Building..."
-swiftc -O -target "$(uname -m)-apple-macos11.0" main.swift -o Sori
+swiftc -O -target "$(uname -m)-apple-macos13.0" $(find "$SRC/Sources" -name "*.swift") -o Sori
 
 # 4. Assemble the app bundle.
 # Read the existing install's signing identity BEFORE overwriting it — step 5 falls back
