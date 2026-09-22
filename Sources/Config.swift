@@ -68,6 +68,10 @@ struct Config: Codable {
     var streamingASR: Bool? = nil          // Experimental: transcribe while recording (OpenAI)
     var instantPaste: Bool? = nil          // Experimental: paste the rule-cleaned text at once, replace in place when the rewrite lands
     var contextAwareness: Bool? = nil      // send the focused field's text before the caret to Smart Rewrite (default on)
+    // Paste lands where the dictation was STARTED, not wherever he is when ASR finishes: if he
+    // switched app/field during the 1–3 s wait, the target is brought back for the ⌘V (+ Enter),
+    // then he is returned to where he had moved. Default on. (2026-09-23)
+    var pasteAtOrigin: Bool? = nil
 
     // Style anchor appended to every whisper prompt. Whisper mimics the prompt's WRITING
     // STYLE — a punctuated prose prompt yields punctuated output; the old bare comma-list

@@ -11,6 +11,11 @@ struct AppContext {
     let appName: String
     let windowTitle: String
     var fieldText: String = ""     // text already in the focused field before the caret (context awareness)
+    // Paste target (2026-09-23): the app + focused field at the moment recording stopped. The
+    // paste is async (1–3 s of ASR + rewrite); if he has moved to another app or field by then,
+    // the pipeline brings THIS target back before ⌘V instead of pasting wherever he is now.
+    var pid: pid_t = 0
+    var focusedElement: AXUIElement? = nil
     var summary: String { "\(appName) [\(bundleId)]" + (windowTitle.isEmpty ? "" : " — \(windowTitle)") }
 
     static func capture() -> AppContext {
@@ -27,17 +32,30 @@ struct AppContext {
             }
         }
         var ctx = AppContext(bundleId: app.bundleIdentifier ?? "", appName: app.localizedName ?? "", windowTitle: title)
-        if Config.load().contextAwareness ?? true { ctx.fieldText = focusedFieldTextBeforeCaret(cap: 1500) }
+        ctx.pid = app.processIdentifier
+        ctx.focusedElement = focusedElement()
+        if Config.load().contextAwareness ?? true, let el = ctx.focusedElement {
+            ctx.fieldText = fieldTextBeforeCaret(el, cap: 1500)
+        }
         return ctx
+    }
+
+    // The system-wide focused UI element (nil when nothing focusable has focus).
+    static func focusedElement() -> AXUIElement? {
+        let sys = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success, let f = focusedRef else { return nil }
+        return (f as! AXUIElement)
     }
 
     // What is already typed in the field, up to the caret (Wispr's "context awareness"). Data for
     // register and continuation only — the rewrite prompt is told never to repeat or rewrite it.
     static func focusedFieldTextBeforeCaret(cap: Int) -> String {
-        let sys = AXUIElementCreateSystemWide()
-        var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success, let f = focusedRef else { return "" }
-        let el = f as! AXUIElement
+        guard let el = focusedElement() else { return "" }
+        return fieldTextBeforeCaret(el, cap: cap)
+    }
+
+    static func fieldTextBeforeCaret(_ el: AXUIElement, cap: Int) -> String {
         var valRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(el, kAXValueAttribute as CFString, &valRef) == .success, let value = valRef as? String, !value.isEmpty else { return "" }
         var end = value.utf16.count

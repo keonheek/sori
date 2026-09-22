@@ -807,6 +807,67 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wlog("pressed Enter (\(reason))")
     }
 
+    // The consumed Enter is re-issued only if he is still in the app he pressed it in. If he
+    // moved on while ASR ran, a forwarded Enter would submit whatever is in the NEW app's field.
+    private func forwardEnter(_ reason: String, target: AppContext) {
+        guard target.pid == 0 || NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid else {
+            wlog("Enter NOT forwarded (\(reason)) — he left \(target.appName)")
+            return
+        }
+        postEnter(reason)
+    }
+
+    // Paste-at-origin: returns nil at once when he is still in the app + field he dictated into.
+    // Otherwise brings the target app (and its focused field) back to the front, waits until it
+    // actually IS frontmost, then calls `body` with a closure that returns him to where he had
+    // moved. Main thread only. Chrome/Electron honour AX focus set on an editable element;
+    // when that fails the paste still goes to that app's own focused field.
+    private func focusTarget(_ target: AppContext?, then body: @escaping (_ goBack: (() -> Void)?) -> Void) {
+        guard cfg.pasteAtOrigin ?? true, let t = target, t.pid > 0 else { body(nil); return }
+        let front = NSWorkspace.shared.frontmostApplication
+        let nowEl = AppContext.focusedElement()
+        let sameApp = front?.processIdentifier == t.pid
+        let sameField: Bool = {
+            guard let a = t.focusedElement, let b = nowEl else { return true }   // unknown → assume same
+            return CFEqual(a, b)
+        }()
+        if sameApp && sameField { body(nil); return }
+        guard let app = NSRunningApplication(processIdentifier: t.pid), !app.isTerminated else {
+            wlog("paste target \(t.appName) is gone — pasting where he is")
+            body(nil); return
+        }
+        wlog("he moved to \(front?.localizedName ?? "?")\(sameApp ? " (other field)" : "") — refocusing \(t.appName) for the paste")
+        func refocus(_ el: AXUIElement?) {
+            guard let el else { return }
+            let r = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            if r != .success { wlog("AX refocus failed (\(r.rawValue))") }
+        }
+        if !sameApp {
+            app.activate(options: [])
+            // Belt and braces for apps that ignore activate() from a background process.
+            AXUIElementSetAttributeValue(AXUIElementCreateApplication(t.pid), kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        }
+        var tries = 0
+        func settle() {
+            tries += 1
+            let isFront = NSWorkspace.shared.frontmostApplication?.processIdentifier == t.pid
+            if isFront || tries >= 12 {
+                if !isFront { wlog("\(t.appName) did not come to front after \(tries) tries — pasting anyway") }
+                refocus(t.focusedElement)
+                let goBack: () -> Void = {
+                    guard !sameApp, let f = front, !f.isTerminated else { refocus(nowEl); return }
+                    f.activate(options: [])
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { refocus(nowEl) }
+                    wlog("returned him to \(f.localizedName ?? "?")")
+                }
+                body(goBack)
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: settle)
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: settle)
+    }
+
     // detectLanguage() removed 2026-08-12. It ran a second ggml-base pass because
     // whisper's in-decode auto-detection was biased by the English style-anchor
     // prompt (Korean detected as English and TRANSLATED, 2026-07-22). Qwen3-ASR
@@ -867,7 +928,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 wlog("transcribe ABORT — WAV missing at \(url.path)")
                 DispatchQueue.main.async {
                     if !self.isRecording { self.setStatusIcon("mic"); self.panel.hide() }
-                    if submit { self.postEnter("forwarded — no audio") }
+                    if submit { self.forwardEnter("forwarded — no audio", target: context) }
                 }
                 return
             }
@@ -916,7 +977,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.async {
                     if !self.isRecording { self.setStatusIcon("exclamationmark.triangle", tint: .systemRed) }
                     self.panel.setError("Speech engine unavailable")
-                    if submit { self.postEnter("forwarded — ASR engine down") }
+                    if submit { self.forwardEnter("forwarded — ASR engine down", target: context) }
                 }
                 return
             }
@@ -978,7 +1039,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     // The user's Enter ended this recording and we CONSUMED it. If there is
                     // no dictation to paste, forward the Enter anyway — swallowing it made
                     // "press Enter" feel dead whenever whisper heard nothing.
-                    if submit { self.postEnter("forwarded — no speech") }
+                    if submit { self.forwardEnter("forwarded — no speech", target: context) }
                 }
                 return
             }
@@ -1029,7 +1090,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 instantId = id
                 DispatchQueue.main.sync {
                     if !self.isRecording { self.setStatusIcon("mic"); self.panel.hide() }
-                    self.paste(quick, submit: false, dictationId: id, startedAt: tStart)
+                    self.paste(quick, submit: false, dictationId: id, startedAt: tStart, target: context)
                 }
                 wlog("instant paste (\(quick.count) chars), refining")
             }
@@ -1087,14 +1148,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if !self.isRecording { self.setStatusIcon("mic"); self.panel.hide() }
                 if !text.isEmpty {
                     let submitNow = (cfg.pressEnter ?? false) || submit
-                    self.paste(text, submit: submitNow, dictationId: dictationId, startedAt: tStart)
+                    self.paste(text, submit: submitNow, dictationId: dictationId, startedAt: tStart, target: context)
                 }
             }
     }
 
     // Puts `text` on the clipboard and posts ⌘V to the frontmost app. Shared by the dictation
     // pipeline and "Paste Last Transcript". Main thread only.
-    func paste(_ input: String, submit: Bool, dictationId: Int64?, startedAt: Date? = nil) {
+    func paste(_ input: String, submit: Bool, dictationId: Int64?, startedAt: Date? = nil, target: AppContext? = nil) {
+        focusTarget(target) { goBack in
+            self.pasteNow(input, submit: submit, dictationId: dictationId, startedAt: startedAt, goBack: goBack)
+        }
+    }
+
+    private func pasteNow(_ input: String, submit: Bool, dictationId: Int64?, startedAt: Date?, goBack: (() -> Void)?) {
         var text = input
         // Consecutive-dictation spacing: back-to-back dictations pasted with no
         // separator ("sentence.Sentence"). If the previous paste ended in a
@@ -1138,7 +1205,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // the ⌘V before the Return arrives, or the submit fires empty.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 self.postEnter("submit")
+                if let goBack { DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: goBack) }
             }
+        } else if let goBack {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: goBack)
         }
     }
 
