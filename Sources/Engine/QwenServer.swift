@@ -114,15 +114,54 @@ enum QwenServer {
         t.standardOutput = FileHandle.nullDevice
         // Keep stderr: the server logs model-load failures there, and a silent
         // engine is the one failure mode that looks identical to a dead hotkey.
+        attachStderrLogger(t)
+        t.terminationHandler = { p in
+            wlog("qwen_server exited (pid \(p.processIdentifier), status \(p.terminationStatus)) — respawns on the next dictation")
+            lock.lock(); defer { lock.unlock() }
+            if proc === p { proc = nil; runningModel = nil }
+        }
+        do { try t.run(); proc = t; runningModel = modelPath; wlog("qwen_server spawned (pid \(t.processIdentifier))") }
+        catch { wlog("qwen_server spawn FAILED: \(error)") }
+    }
+
+    /// Pipe the child's stderr into the log, line by line. Keep stderr: the server logs
+    /// model-load failures there, and a silent engine is the one failure mode that looks
+    /// identical to a dead hotkey.
+    ///
+    /// Empty `availableData` = EOF (the child exited). The handler MUST clear itself then:
+    /// the dispatch source keeps firing on a closed pipe, and a handler that just returns
+    /// spins a thread at 100% CPU until Sori restarts (2026-09-22: 6 h at 100% after the
+    /// engine's own inference-timeout exit). Regression check: `Sori --engine-pipe-test`.
+    static func attachStderrLogger(_ t: Process, tag: String = "qwen") {
         let errPipe = Pipe()
         t.standardError = errPipe
         errPipe.fileHandleForReading.readabilityHandler = { h in
             let d = h.availableData
-            guard !d.isEmpty, let s = String(data: d, encoding: .utf8) else { return }
-            for line in s.split(separator: "\n") where !line.isEmpty { wlog("[qwen] \(line)") }
+            if d.isEmpty { h.readabilityHandler = nil; return }
+            guard let s = String(data: d, encoding: .utf8) else { return }
+            for line in s.split(separator: "\n") where !line.isEmpty { wlog("[\(tag)] \(line)") }
         }
-        do { try t.run(); proc = t; runningModel = modelPath; wlog("qwen_server spawned (pid \(t.processIdentifier))") }
-        catch { wlog("qwen_server spawn FAILED: \(error)") }
+    }
+
+    /// `--engine-pipe-test`: spawn a child that writes one stderr line and exits, through the
+    /// same logger ensureRunning uses, then measure this process's CPU over 2 s of idle.
+    /// Returns true when the pipe went quiet (< 0.3 CPU-s); the bug burned ~2.0.
+    static func pipeSpinTest() -> Bool {
+        let t = Process()
+        t.launchPath = "/bin/sh"
+        t.arguments = ["-c", "echo pipe-test >&2; exit 0"]
+        t.standardOutput = FileHandle.nullDevice
+        attachStderrLogger(t, tag: "pipe-test")
+        do { try t.run() } catch { print("spawn failed: \(error)"); return false }
+        t.waitUntilExit()
+        func cpu() -> Double {
+            var r = rusage(); getrusage(RUSAGE_SELF, &r)
+            return Double(r.ru_utime.tv_sec) + Double(r.ru_utime.tv_usec) / 1e6
+                 + Double(r.ru_stime.tv_sec) + Double(r.ru_stime.tv_usec) / 1e6
+        }
+        let c0 = cpu(); Thread.sleep(forTimeInterval: 2); let used = cpu() - c0
+        print(String(format: "engine-pipe-test: %.2f CPU-s over 2 s idle after child exit (%@)", used, used < 0.3 ? "OK" : "SPINNING"))
+        return used < 0.3
     }
 
     static func stop() {

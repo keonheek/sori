@@ -8,6 +8,7 @@ import IOKit.hid
 // terminal commands, not a second copy of the app, and must work while Sori is running.
 if CommandLine.arguments.contains("--version") { print("Sori \(soriVersion)"); exit(0) }
 if CommandLine.arguments.contains("--check-update") { Updater.runCLICheck() }
+if CommandLine.arguments.contains("--engine-pipe-test") { exit(QwenServer.pipeSpinTest() ? 0 : 1) }
 // Store maintenance, run while the app is up (the store is multi-process safe: WAL + full mutex).
 if let i = CommandLine.arguments.firstIndex(of: "--import-log"), i + 1 < CommandLine.arguments.count {
     let n = LogImport.run(path: CommandLine.arguments[i + 1]); print("imported \(n) dictations"); exit(0)
