@@ -75,13 +75,18 @@ enum InputDevice {
         // system default is a no-op (engine path), so unplugging it falls back cleanly.
         if let uid = pinnedUID, !uid.isEmpty {
             if let dev = allInputs().first(where: { $0.uid == uid }) {
-                if dev.id == systemDefault()?.id, !(avoidBluetooth && isBluetooth(dev.transport)) { return nil }
                 wlog("capturing from pinned input '\(dev.name)'")
                 return dev
             }
             wlog("pinned input \(uid) not present — using the system default")
         }
-        guard avoidBluetooth, let def = systemDefault(), isBluetooth(def.transport) else { return nil }
+        // Never fall through to AVAudioEngine.inputNode: 2026-10-04 it bound to the silent 3-ch
+        // aggregate "Meeting-In" while the system default was the built-in mic (all-silence WAVs).
+        // Capture the resolved default device directly instead.
+        guard let def = systemDefault() else { return nil }
+        guard avoidBluetooth, isBluetooth(def.transport) else {
+            wlog("capturing from default input '\(def.name)'"); return def
+        }
         let t1 = DispatchTime.now().uptimeNanoseconds
         guard let mic = builtInMic() else {
             wlog("default input '\(def.name)' is Bluetooth but no built-in mic found — using it anyway"); return nil
