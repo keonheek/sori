@@ -659,7 +659,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         let h = ScreenVocab.harvest(pid: pid)
                         DispatchQueue.main.async {
                             let t0 = Date()
-                            let terms = ScreenVocab.rank(texts: h.texts, title: h.title, known: known)
+                            let terms = ScreenVocab.rank(texts: h.texts, title: h.title, known: known, limit: 20)
                             c?.configure(screenTerms: terms)
                             wlog("screen vocab: \(terms.count) terms (walk \(h.ms) ms, \(h.nodes) nodes, rank \(Int(Date().timeIntervalSince(t0) * 1000)) ms): \(terms.prefix(12).joined(separator: ", "))")
                         }
@@ -973,19 +973,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     stream?.cancel()
                     wlog("vad gate: no speech — cloud transcribe skipped")
                 } else {
-                    // Streaming session first (only the tail is pending), batch upload if it failed.
-                    if let s = stream { cloudText = s.finish(timeout: 4) }
-                    if let t = cloudText, let bad = TextCleanup.foreignScript(t) {
-                        wlog("realtime transcript has a foreign script (\(bad)) — redoing with batch: \"\(t.prefix(80))\"")
-                        cloudText = nil
+                    let hint = [cfg.promptHint, vocabulary].filter { !$0.isEmpty }.joined(separator: ", ")
+                    // The live model has no file endpoint; the batch fallback always uses gpt-transcribe there.
+                    let model = cfg.asrCloudModel ?? "gpt-transcribe"
+                    let batch = { OpenAITranscribe.transcribe(wav: url.path, model: model.hasPrefix("gpt-live") ? "gpt-transcribe" : model, prompt: hint) }
+                    if let s = stream {
+                        cloudText = AppDelegate.raceStream(s, batch: batch, audioSec: AppDelegate.wavSeconds(url.path))
+                    } else {
+                        cloudText = batch()
                     }
-                    if cloudText == nil {
-                        let hint = [cfg.promptHint, vocabulary].filter { !$0.isEmpty }.joined(separator: ", ")
-                        // The live model has no file endpoint; the batch fallback always uses gpt-transcribe there.
-                        let model = cfg.asrCloudModel ?? "gpt-transcribe"
-                        cloudText = OpenAITranscribe.transcribe(wav: url.path, model: model.hasPrefix("gpt-live") ? "gpt-transcribe" : model, prompt: hint)
-                        if cloudText == nil { wlog("openai transcribe FAILED — falling back to local qwen") }
-                    }
+                    if cloudText == nil { wlog("openai transcribe FAILED — falling back to local qwen") }
                 }
             }
             if let c = cloudText {
@@ -1174,27 +1171,114 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if !self.isRecording { self.setStatusIcon("mic"); self.panel.hide() }
                 if !text.isEmpty {
                     let submitNow = (cfg.pressEnter ?? false) || submit
-                    self.paste(text, submit: submitNow, dictationId: dictationId, startedAt: tStart, target: context)
+                    self.paste(text, submit: submitNow, dictationId: dictationId, startedAt: tStart, target: context, shape: true)
                 }
             }
     }
 
+    static func wavSeconds(_ path: String) -> Double {
+        let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? 0
+        return Double(max(0, size - 44)) / 32000   // 16 kHz mono int16
+    }
+
+    // Wispr's GrpcHttpRace: the stream gets 2 s after commit; if it has not answered by then (clips
+    // under 30 s), batch starts in parallel and the first usable transcript wins. A stream that ends
+    // empty, fails, or comes back in a foreign script hands over to batch at once.
+    final class Race {
+        private let lock = NSLock(); private var results: [(String, String?)] = []
+        let signal = DispatchSemaphore(value: 0)
+        func offer(_ who: String, _ text: String?) { lock.lock(); results.append((who, text)); lock.unlock(); signal.signal() }
+        var winner: (String, String)? { lock.lock(); defer { lock.unlock() }; return results.first { $0.1 != nil }.map { ($0.0, $0.1!) } }
+        var finished: Int { lock.lock(); defer { lock.unlock() }; return results.count }
+    }
+
+    static func raceStream(_ s: OpenAIRealtime, batch: @escaping () -> String?, audioSec: Double) -> String? {
+        race(stream: { s.finish(timeout: 4) }, batch: batch, audioSec: audioSec)
+    }
+
+    static func race(stream: @escaping () -> String?, batch: @escaping () -> String?, audioSec: Double, headStart: Double = 2.0, longWait: Double = 6) -> String? {
+        let race = Race()
+        DispatchQueue.global(qos: .userInitiated).async {
+            var r = stream()
+            if let t = r, let bad = TextCleanup.foreignScript(t) {
+                wlog("realtime transcript has a foreign script (\(bad)) — batch takes over: \"\(t.prefix(80))\"")
+                r = nil
+            }
+            race.offer("stream", r)
+        }
+        var batchStarted = false
+        func startBatch(_ why: String) {
+            batchStarted = true; wlog(why)
+            DispatchQueue.global(qos: .userInitiated).async { race.offer("batch", batch()) }
+        }
+        let t0 = Date(), deadline = t0.addingTimeInterval(20)
+        while Date() < deadline {
+            let timeout: DispatchTime = batchStarted ? .now() + deadline.timeIntervalSinceNow : .now() + max(0, headStart - Date().timeIntervalSince(t0))
+            let waited = race.signal.wait(timeout: timeout)
+            if let (who, text) = race.winner {
+                if who == "batch" { wlog(String(format: "batch won the race (%.2fs)", Date().timeIntervalSince(t0))) }
+                return text
+            }
+            if batchStarted { if race.finished >= 2 { return nil }; continue }
+            if race.finished >= 1 { startBatch("realtime gave no usable transcript — batch") }
+            else if waited == .timedOut {
+                if audioSec < 30 { startBatch(String(format: "realtime silent %.1fs after commit — racing batch", headStart)) }
+                else { let _ = race.signal.wait(timeout: .now() + longWait); if let w = race.winner { return w.1 }; startBatch("realtime gave no usable transcript — batch") }
+            }
+        }
+        return race.winner?.1
+    }
+
+    // (stream delay, stream text, batch delay, batch text, audio s, expected text, max seconds)
+    static func raceSelfTest() -> Bool {
+        let cases: [(Double, String?, Double, String?, Double, String?, Double, String)] = [
+            (0.05, "stream", 0.05, "batch", 5, "stream", 0.15, "fast stream wins, batch never starts"),
+            (0.6, "stream", 0.05, "batch", 5, "batch", 0.45, "stalled stream: batch races after head start"),
+            (0.05, nil, 0.05, "batch", 5, "batch", 0.2, "empty stream hands over at once"),
+            (0.05, "তারপর open", 0.05, "batch", 5, "batch", 0.2, "foreign script hands over"),
+            (0.6, "stream", 0.05, "batch", 40, "stream", 0.75, "long clip waits for the stream"),
+            (0.05, nil, 0.05, nil, 5, nil, 0.2, "both fail -> nil"),
+        ]
+        var ok = true
+        for (sd, st, bd, bt, sec, want, maxS, name) in cases {
+            var batchRan = false
+            let t0 = Date()
+            let got = race(stream: { usleep(UInt32(sd * 1e6)); return st },
+                           batch: { batchRan = true; usleep(UInt32(bd * 1e6)); return bt }, audioSec: sec, headStart: 0.3, longWait: 0.5)
+            let dt = Date().timeIntervalSince(t0)
+            let pass = got == want && dt <= maxS && !(name.hasPrefix("fast") && batchRan)
+            if !pass { ok = false }
+            print("\(pass ? "ok  " : "FAIL") \(name): got \(got ?? "nil") in \(String(format: "%.2f", dt))s")
+        }
+        return ok
+    }
+
     // Puts `text` on the clipboard and posts ⌘V to the frontmost app. Shared by the dictation
     // pipeline and "Paste Last Transcript". Main thread only.
-    func paste(_ input: String, submit: Bool, dictationId: Int64?, startedAt: Date? = nil, target: AppContext? = nil) {
+    func paste(_ input: String, submit: Bool, dictationId: Int64?, startedAt: Date? = nil, target: AppContext? = nil, shape: Bool = false) {
+        // Wispr-style cursor context (casing, spacing, trailing period) when the field was readable;
+        // terminals expose scrollback, not a field, so they keep the recency rule below.
+        var text = input, shaped = false
+        if shape, let t = target, t.fieldReadable, !Learn.fieldWatchSkip.contains(t.bundleId) {
+            let names = Set(DictionaryRepo.biasTerms(cfg: cfg).map { $0.lowercased() })
+            text = PasteShaping.shape(input, field: .init(before: t.fieldText, after: t.fieldAfter), chat: t.kind == .chat, names: names)
+            shaped = true
+            if text != input { wlog("paste shaped to cursor context: [\(input.prefix(30))…] -> [\(text.prefix(30))…]") }
+        }
         focusTarget(target) { goBack in
-            self.pasteNow(input, submit: submit, dictationId: dictationId, startedAt: startedAt, goBack: goBack)
+            self.pasteNow(text, submit: submit, dictationId: dictationId, startedAt: startedAt, goBack: goBack, shaped: shaped,
+                          terminal: target.map { Learn.fieldWatchSkip.contains($0.bundleId) } ?? false)
         }
     }
 
-    private func pasteNow(_ input: String, submit: Bool, dictationId: Int64?, startedAt: Date?, goBack: (() -> Void)?) {
+    private func pasteNow(_ input: String, submit: Bool, dictationId: Int64?, startedAt: Date?, goBack: (() -> Void)?,
+                          shaped: Bool = false, terminal: Bool = false) {
         var text = input
         // Consecutive-dictation spacing: back-to-back dictations pasted with no
         // separator ("sentence.Sentence"). If the previous paste ended in a
         // non-whitespace char recently, and this one starts with a word char,
-        // prepend one space. (We can't read the focused field; recency is the
-        // best available proxy for "appending to the same text".)
-        if let lastEnd = self.lastPasteEnd,
+        // prepend one space. (Only when the field could not be read; shaping already spaced it.)
+        if !shaped, let lastEnd = self.lastPasteEnd,
            Date().timeIntervalSince(self.lastPasteAt) < 600,
            !lastEnd.isWhitespace,
            let first = text.first,
@@ -1206,13 +1290,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Text always stays on the clipboard afterwards, so ⌘V recovers it
         // if the auto-paste lands in the wrong place or gets cancelled.
         let pb = NSPasteboard.general
-        pb.declareTypes([.string], owner: nil); pb.setString(text, forType: .string)
         let src = wpttEventSource()
-        // ⌘V paste
-        let down = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: true)
-        let up = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)
-        down?.flags = .maskCommand; up?.flags = .maskCommand
-        down?.post(tap: .cgAnnotatedSessionEventTap); up?.post(tap: .cgAnnotatedSessionEventTap)
+        func cmdV(_ piece: String) {
+            pb.declareTypes([.string], owner: nil); pb.setString(piece, forType: .string)
+            let down = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: true)
+            let up = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)
+            down?.flags = .maskCommand; up?.flags = .maskCommand
+            down?.post(tap: .cgAnnotatedSessionEventTap); up?.post(tap: .cgAnnotatedSessionEventTap)
+        }
+        // In a terminal (Claude Code in cmux), a long paste collapses into "[Pasted text]"; paste it
+        // in pieces like Wispr does. The full text goes back on the clipboard after the last piece.
+        let pieces = terminal && (cfg.chunkTerminalPaste ?? true) ? PasteShaping.chunks(text) : [text]
+        var extraDelay = 0.0
+        if pieces.count > 1 {
+            for (k, piece) in pieces.enumerated() {
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(k) * 0.15) { cmdV(piece) }
+            }
+            extraDelay = Double(pieces.count - 1) * 0.15
+            DispatchQueue.main.asyncAfter(deadline: .now() + extraDelay + 0.15) {
+                pb.declareTypes([.string], owner: nil); pb.setString(text, forType: .string)
+            }
+            wlog("pasted in \(pieces.count) pieces for the terminal (\(pieces.map(\.count)))")
+        } else {
+            cmdV(text)
+        }
         wlog("pasted (clipboard retained for ⌘V recovery)")
         if let id = dictationId {
             DictationRepo.markPasted(id, totalMs: startedAt.map { Int(Date().timeIntervalSince($0) * 1000) })
@@ -1233,12 +1334,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if submit {
             // 0.3s: slow targets (browsers, Electron apps) need time to process
             // the ⌘V before the Return arrives, or the submit fires empty.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3 + extraDelay) {
                 self.postEnter("submit")
                 if let goBack { DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: goBack) }
             }
         } else if let goBack {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: goBack)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3 + extraDelay, execute: goBack)
         }
     }
 

@@ -51,6 +51,11 @@ enum ScreenVocab {
         guard let s = try? String(contentsOfFile: "/usr/share/dict/words", encoding: .utf8) else { return [] }
         return Set(s.split(separator: "\n").filter { $0.first?.isLowercase == true }.map(String.init))
     }()
+    // Capitalized-only entries of the same list (Claude, Seoul, Roland): proper nouns.
+    static let proper: Set<String> = {
+        guard let s = try? String(contentsOfFile: "/usr/share/dict/words", encoding: .utf8) else { return [] }
+        return Set(s.split(separator: "\n").filter { $0.first?.isUppercase == true && !common.contains($0.lowercased()) }.map(String.init))
+    }()
 
     // UI chrome and words the word list lacks in this form; never worth a keyword.
     static let stop: Set<String> = ["http", "https", "www", "com", "html", "null", "true", "false", "nil", "self", "todo",
@@ -80,7 +85,7 @@ enum ScreenVocab {
         return known
     }
 
-    static func preload() { DispatchQueue.global(qos: .utility).async { _ = common.count } }
+    static func preload() { DispatchQueue.global(qos: .utility).async { _ = common.count; _ = proper.count } }
 
     // 3 = shape no model guesses (camelCase, ACRONYM, file.ext, letters+digits, snake_case);
     // 2 = Capitalized word not in the English list (a name); 1 = other unlisted lowercase word; 0 = skip.

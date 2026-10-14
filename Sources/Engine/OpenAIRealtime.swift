@@ -85,7 +85,7 @@ final class OpenAIRealtime {
     private var screenKeywords: [String] = []
 
     // Names (dictionary) first, then screen words, then the rest; one line each, no < >.
-    static let maxKeywords = 80
+    static let maxKeywords = 60
     static func mergeKeywords(base: [String], names: Int, screen: [String]) -> [String] {
         var seen = Set<String>(), out: [String] = []
         for t in Array(base.prefix(names)) + screen + Array(base.dropFirst(names)) {

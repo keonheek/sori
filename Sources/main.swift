@@ -17,6 +17,8 @@ if CommandLine.arguments.contains("--script-test") {
     exit(ok ? 0 : 1)
 }
 if CommandLine.arguments.contains("--vocab-test") { exit(ScreenVocab.selfTest() ? 0 : 1) }
+if CommandLine.arguments.contains("--race-test") { exit(AppDelegate.raceSelfTest() ? 0 : 1) }
+if CommandLine.arguments.contains("--shape-test") { exit(PasteShaping.selfTest() ? 0 : 1) }
 // Screen-vocab probe on a running app (read-only Accessibility walk): --vocab-probe <bundle id>
 if let i = CommandLine.arguments.firstIndex(of: "--vocab-probe"), i + 1 < CommandLine.arguments.count {
     guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: CommandLine.arguments[i + 1]).first else { print("not running"); exit(1) }

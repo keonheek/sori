@@ -11,6 +11,8 @@ struct AppContext {
     let appName: String
     let windowTitle: String
     var fieldText: String = ""     // text already in the focused field before the caret (context awareness)
+    var fieldAfter: String = ""    // text after the caret (paste shaping)
+    var fieldReadable = false      // the focused element exposed a string value (empty field included)
     // Paste target (2026-09-23): the app + focused field at the moment recording stopped. The
     // paste is async (1–3 s of ASR + rewrite); if he has moved to another app or field by then,
     // the pipeline brings THIS target back before ⌘V instead of pasting wherever he is now.
@@ -36,6 +38,7 @@ struct AppContext {
         ctx.focusedElement = focusedElement()
         if Config.load().contextAwareness ?? true, let el = ctx.focusedElement {
             ctx.fieldText = fieldTextBeforeCaret(el, cap: 1500)
+            if let a = fieldTextAfterCaret(el, cap: 200) { ctx.fieldReadable = true; ctx.fieldAfter = a }
         }
         return ctx
     }
@@ -67,6 +70,20 @@ struct AppContext {
         let u = Array(value.utf16.prefix(end))
         let tail = u.suffix(cap)
         return String(utf16CodeUnits: Array(tail), count: tail.count).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // Text after the caret (nil = the element has no readable string value).
+    static func fieldTextAfterCaret(_ el: AXUIElement, cap: Int) -> String? {
+        var valRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXValueAttribute as CFString, &valRef) == .success, let value = valRef as? String else { return nil }
+        var start = value.utf16.count
+        var rangeRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success, let rv = rangeRef {
+            var r = CFRange()
+            if AXValueGetValue(rv as! AXValue, .cfRange, &r), r.location >= 0, r.location + r.length <= start { start = r.location + r.length }
+        }
+        let u = Array(value.utf16.dropFirst(start).prefix(cap))
+        return String(utf16CodeUnits: u, count: u.count)
     }
 
     enum Kind: String { case chat, mail, docs, code, aiChat, general }
