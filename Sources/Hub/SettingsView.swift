@@ -36,10 +36,15 @@ struct SettingsView: View {
                     .background(Theme.bg).clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                     .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(Theme.border, lineWidth: 1))
             }
-            SettingRow(label: "Microphone", detail: "AirPods stay on the built-in mic so music never pauses; pick a device to pin it.") {
+            SettingRow(label: "Microphone", detail: "AirPods stay on the built-in mic so music never pauses; pick a device to pin it. An unplugged pick falls back to the system default.") {
                 Picker("", selection: model.binding(\.inputDeviceUID, default: "")) {
                     Text("System default").tag("")
                     ForEach(model.inputs, id: \.uid) { Text($0.name).tag($0.uid) }
+                    // A pinned mic that is unplugged still needs a row, or the picker renders blank.
+                    if let uid = model.cfg.inputDeviceUID, !uid.isEmpty, !model.inputs.contains(where: { $0.uid == uid }) {
+                        let parts = uid.split(separator: ":")
+                        Text("\(parts.count >= 3 ? String(parts[2]) : "Saved mic") (not connected)").tag(uid)
+                    }
                 }
                 .labelsHidden().frame(width: 260)
             }
@@ -49,7 +54,7 @@ struct SettingsView: View {
                 }
                 .labelsHidden().frame(width: 140)
             }
-            SettingRow(label: "Transcriber", detail: "Accurate: gpt-transcribe, 3.1% CER on your read-aloud clip, text ~1.2 s after release when streaming. Fastest: gpt-live-transcribe, ~0.5 s but 6.9% CER on the same clip. Local runs offline and is the fallback either way.") {
+            SettingRow(label: "Transcriber", detail: "Fastest: gpt-live-transcribe, text ~0.8 s after release, 4.3% CER on your read-aloud clip with your vocabulary as hints. Accurate: gpt-transcribe, 3.1% CER, ~1.2 s. Local runs offline and is the fallback either way.") {
                 Picker("", selection: Binding(get: { model.transcriberChoice }, set: { model.setTranscriber($0) })) {
                     Text("OpenAI, accurate").tag("openai:gpt-transcribe")
                     Text("OpenAI, fastest").tag("openai:gpt-live-transcribe")
@@ -88,6 +93,12 @@ struct SettingsView: View {
             SettingRow(label: "Sounds", detail: "Start and stop blips.") {
                 Toggle("", isOn: model.binding(\.sound, default: true)).labelsHidden().toggleStyle(.switch)
             }
+            SettingRow(label: "Split long terminal pastes", detail: "Long dictations go into cmux and other terminals in pieces, so Claude Code shows the text instead of a [Pasted text] stub.") {
+                Toggle("", isOn: model.binding(\.chunkTerminalPaste, default: true)).labelsHidden().toggleStyle(.switch)
+            }
+            SettingRow(label: "Skip Smart Rewrite in terminals", detail: "cmux, Terminal and other terminals get rule cleanup only (fillers out, no AI polish). A little faster per dictation.") {
+                Toggle("", isOn: model.binding(\.skipRewriteInTerminals, default: false)).labelsHidden().toggleStyle(.switch)
+            }
             SettingRow(label: "Press Enter after pasting", detail: "Submits every dictation. Right ⌘ + Enter does it per dictation without this.") {
                 Toggle("", isOn: model.binding(\.pressEnter, default: false)).labelsHidden().toggleStyle(.switch)
             }
@@ -116,6 +127,9 @@ struct SettingsView: View {
             }
             SettingRow(label: "Use on-screen text as context", detail: "Sends the text already in the field (before the cursor, up to 1,500 characters) with the rewrite so it matches language and continues your sentence. Off keeps only the app name.") {
                 Toggle("", isOn: model.binding(\.contextAwareness, default: true)).labelsHidden().toggleStyle(.switch)
+            }
+            SettingRow(label: "Read words on screen", detail: "When you start talking, names, file names and code terms in the focused window are sent to the fastest transcriber as spelling hints (up to 20).") {
+                Toggle("", isOn: model.binding(\.screenVocab, default: true)).labelsHidden().toggleStyle(.switch)
             }
             SettingRow(label: "Keep recordings", detail: "Saves each dictation's audio under ~/Dev/sori/tests/eval/personal/raw. Off by default.") {
                 Toggle("", isOn: Binding(get: { !(model.cfg.keepRecordingsDir ?? "").isEmpty },

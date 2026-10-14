@@ -113,7 +113,9 @@ enum DictationRepo {
         st.countToday = Int(db.scalar("SELECT COUNT(*) FROM dictations WHERE ts>=? AND pasted=1", [.real(dayStart)]))
         st.wordsWeek = Int(db.scalar("SELECT COALESCE(SUM(words),0) FROM dictations WHERE ts>=? AND pasted=1", [.real(weekStart)]))
         st.countWeek = Int(db.scalar("SELECT COUNT(*) FROM dictations WHERE ts>=? AND pasted=1", [.real(weekStart)]))
-        st.avgLatencyMs = Int(db.scalar("SELECT COALESCE(AVG(asr_ms+rewrite_ms),0) FROM dictations WHERE ts>=? AND asr_ms>0", [.real(weekStart)]))
+        // Median, not mean: one stuck 30 s dictation used to drag the card to 2.7 s while a typical one took ~1.1 s.
+        let lat = db.query("SELECT asr_ms+rewrite_ms AS l FROM dictations WHERE ts>=? AND asr_ms>0 ORDER BY l", [.real(weekStart)]).map { Int($0.int("l")) }
+        st.avgLatencyMs = lat.isEmpty ? 0 : lat[lat.count / 2]
         let audioMs = db.scalar("SELECT COALESCE(SUM(audio_ms),0) FROM dictations WHERE ts>=? AND pasted=1 AND audio_ms>0", [.real(weekStart)])
         let audioWords = db.scalar("SELECT COALESCE(SUM(words),0) FROM dictations WHERE ts>=? AND pasted=1 AND audio_ms>0", [.real(weekStart)])
         st.wpm = audioMs > 0 ? Int(audioWords / (audioMs / 60000.0)) : 0

@@ -23,7 +23,7 @@ struct HubRootView: View {
             case .settings: SettingsView(model: model)
             }
         }
-        .frame(minWidth: 760, minHeight: 480)
+        .frame(minWidth: HubController.minSize.width, minHeight: HubController.minSize.height)
     }
 }
 
@@ -46,10 +46,49 @@ final class HubController: NSWindowController, NSWindowDelegate {
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    // Below this the sidebar labels and the Style cards clip (seen 2026-10-14 at a saved 760×532).
+    static let minSize = NSSize(width: 980, height: 620)
+
     func show() {
         model.reload()
-        NSApp.activate(ignoringOtherApps: true)
+        if let w = window, w.frame.width < Self.minSize.width || w.frame.height < Self.minSize.height {
+            w.setContentSize(NSSize(width: max(w.frame.width, Self.minSize.width), height: max(w.frame.height, Self.minSize.height)))
+            w.center()
+        }
+        // An accessory app is not always granted activation (macOS 14+), and its window stays on the
+        // Space it was made on: pull it to the current Space and order it front regardless.
+        window?.collectionBehavior.insert(.moveToActiveSpace)
+        if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
         window?.makeKeyAndOrderFront(nil)
+        window?.orderFrontRegardless()
+    }
+
+    // Real-window render of every section for self-review: the actual HubRootView (NavigationSplitView
+    // sidebar included) in a borderless window parked far off-screen, never key, never activated.
+    // Writes <dir>/<section>-<w>x<h>.png. Used by `--hub-shots <dir> [w h]`.
+    @MainActor static func shots(dir: String, size: NSSize) -> Int {
+        let model = HubModel()
+        let win = NSWindow(contentRect: NSRect(x: -30000, y: -30000, width: size.width, height: size.height),
+                           styleMask: [.titled, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
+        win.titlebarAppearsTransparent = true
+        win.contentView = NSHostingView(rootView: HubRootView(model: model))
+        win.setContentSize(size)
+        win.orderFrontRegardless()
+        var n = 0
+        for s in HubModel.Section.allCases {
+            model.section = s
+            model.reload()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+            // The window server keeps an off-screen window's backing store; screencapture -l reads it.
+            let out = "\(dir)/\(s.rawValue.lowercased())-\(Int(size.width))x\(Int(size.height)).png"
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            p.arguments = ["-x", "-o", "-l\(win.windowNumber)", out]
+            try? p.run(); p.waitUntilExit()
+            if p.terminationStatus == 0, FileManager.default.fileExists(atPath: out) { n += 1 }
+        }
+        win.orderOut(nil)
+        return n
     }
 
     // Headless render for review: SwiftUI's ImageRenderer draws the pure-SwiftUI Home body with

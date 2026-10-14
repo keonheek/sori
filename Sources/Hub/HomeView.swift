@@ -39,9 +39,9 @@ struct HomeContent: View {
             StatTile(value: fmt(s.wordsToday), label: "Words today", detail: "\(fmt(s.wordsWeek)) this week")
             StatTile(value: "\(s.countToday)", label: "Dictations today", detail: "\(s.countWeek) this week")
             StatTile(value: s.avgLatencyMs > 0 ? "\(String(format: "%.1f", Double(s.avgLatencyMs) / 1000)) s" : "—",
-                     label: "Release to text", detail: "ASR + rewrite, 7-day average")
+                     label: "Release to text", detail: "Typical, last 7 days")
             StatTile(value: s.topApps.first?.name ?? "—", label: "Most used in",
-                     detail: s.topApps.dropFirst().map { $0.name }.joined(separator: " · "))
+                     detail: s.topApps.count > 1 ? "then " + s.topApps.dropFirst().map { $0.name }.joined(separator: ", ") : "")
         }
     }
 

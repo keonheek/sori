@@ -304,6 +304,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openHubAction() { openHub(section: .home) }
+    // Opening Sori from Finder, Spotlight or `open -a Sori` while it runs shows the Hub (as Wispr does).
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openHub(section: .home); return false
+    }
     @objc func openStyle() { openHub(section: .style) }
     func openHub(section: HubModel.Section) {
         if hub == nil { hub = HubController() }
@@ -1079,8 +1083,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // High = Smart Rewrite with the category's tone.
             let category = StyleResolver.category(for: context)
             let style = StyleResolver.setting(cfg: cfg, category: category)
-            let level = style.levelValue
-            wlog("style: \(category.rawValue) \(style.tone)/\(style.level) — \(context.summary)")
+            var level = style.levelValue
+            // His toggle (2026-10-14): terminals skip the LLM pass and keep the rule cleanup.
+            if level == .high, (cfg.skipRewriteInTerminals ?? false), Learn.fieldWatchSkip.contains(context.bundleId) { level = .light }
+            wlog("style: \(category.rawValue) \(style.tone)/\(level.rawValue) — \(context.summary)")
             // Spoken formatting ("new paragraph", "scratch that"): split into pieces first so the
             // command words never reach the LLM; each piece is cleaned/rewritten on its own.
             let pieces: [Formatting.Piece] = Formatting.hasCommands(text) ? Formatting.parse(text) : [.text(text)]

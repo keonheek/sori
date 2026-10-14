@@ -126,6 +126,15 @@ if let i = CommandLine.arguments.firstIndex(of: "--hub-snapshot"), i + 1 < Comma
     print(ok ? "wrote \(CommandLine.arguments[i + 1])" : "snapshot FAILED"); exit(ok ? 0 : 1)
 }
 
+if let i = CommandLine.arguments.firstIndex(of: "--hub-shots"), i + 1 < CommandLine.arguments.count {
+    let a = CommandLine.arguments
+    let size = i + 3 < a.count ? NSSize(width: Double(a[i + 2]) ?? 980, height: Double(a[i + 3]) ?? 620) : HubController.minSize
+    let snapApp = NSApplication.shared
+    snapApp.setActivationPolicy(.prohibited)
+    let n = MainActor.assumeIsolated { HubController.shots(dir: a[i + 1], size: size) }
+    print("wrote \(n) sections"); exit(n == HubModel.Section.allCases.count ? 0 : 1)
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

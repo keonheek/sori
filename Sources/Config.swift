@@ -67,6 +67,7 @@ struct Config: Codable {
     var commandMode: Bool? = nil           // Experimental: Right ⌘ + Right ⌥ edits the selection
     var streamingASR: Bool? = nil          // Experimental: transcribe while recording (OpenAI)
     var chunkTerminalPaste: Bool? = nil    // split long terminal pastes so Claude Code shows them inline (default on)
+    var skipRewriteInTerminals: Bool? = nil  // terminals (cmux, Claude Code) get Light cleanup instead of Smart Rewrite (default off)
     var screenVocab: Bool? = nil           // gpt-live-transcribe: words read off the focused window become keywords (default on)
     var liveDelay: String? = nil           // gpt-live-transcribe delay: minimal/low/medium/high/xhigh (default medium)
     var streamSegmentSec: Double? = nil    // streaming: commit at a pause once this much audio is pending (0/nil = one commit at release)
