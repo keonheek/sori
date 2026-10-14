@@ -7,7 +7,7 @@ import IOKit.hid
 // MARK: - Version + updates
 // THE single source of truth for the version. install.sh and make-release.sh both grep this
 // line for the bundle plist and the release zip name, so there is exactly one number to bump.
-let soriVersion = "1.0.11"
+let soriVersion = "1.0.12"
 
 // "Check for Updates…" — what it can actually do depends on how Sori was installed, because
 // macOS ties Accessibility/Input Monitoring grants to the code signature:

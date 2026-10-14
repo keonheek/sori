@@ -11,7 +11,7 @@ import IOKit.hid
 // Key from GROQ_API_KEY env or ~/.sori-groq (chmod 600).
 enum LLMCleanup {
     // MARK: Smart Rewrite (app-aware) — grammar, punctuation, light phrasing
-    static func smartRewrite(_ text: String, context: AppContext, tone: Tone = .neutral) -> String? {
+    static func smartRewrite(_ text: String, context: AppContext, tone: Tone = .neutral, deadline: TimeInterval = 6) -> String? {
         guard let key = apiKey(), !key.isEmpty, !text.isEmpty else { return nil }
         guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else { return nil }
         let style: String
@@ -71,19 +71,22 @@ Examples (input => output):
         req.httpBody = payload
         req.timeoutInterval = 5
         let sem = DispatchSemaphore(value: 0)
-        var out: String? = nil
+        let box = OutBox()
         URLSession.shared.dataTask(with: req) { data, _, err in
             defer { sem.signal() }
             if let err = err { wlog("smart rewrite error: \(err)"); return }
             guard let data = data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
             if let choices = json["choices"] as? [[String: Any]],
                let msg = (choices.first?["message"] as? [String: Any])?["content"] as? String {
-                out = msg.trimmingCharacters(in: .whitespacesAndNewlines)
+                box.set(msg.trimmingCharacters(in: .whitespacesAndNewlines))
             } else if let errObj = json["error"] as? [String: Any] {
                 wlog("smart rewrite API error: \(errObj["message"] as? String ?? "?")")
             }
         }.resume()
-        _ = sem.wait(timeout: .now() + 6)
+        // A late rewrite is worse than none: past the deadline the rule-cleaned text pastes instead
+        // (Groq tail: p95 0.97 s, max 5.1 s over 147 dictations, 2026-10-14).
+        if sem.wait(timeout: .now() + deadline) == .timedOut { wlog(String(format: "smart rewrite past %.1fs deadline — pasting without it", deadline)); return nil }
+        let out = box.get()
         guard var cleaned = out else { return nil }
         cleaned = cleaned.replacingOccurrences(of: "(?s)<think>.*?</think>", with: "", options: .regularExpression)
                          .replacingOccurrences(of: "<transcript>", with: "").replacingOccurrences(of: "</transcript>", with: "")
@@ -291,4 +294,11 @@ Examples (input => output):
         }
         return nil
     }
+}
+
+// Callback result handed across threads; the waiter may give up before the callback writes.
+final class OutBox {
+    private let lock = NSLock(); private var v: String?
+    func set(_ s: String) { lock.lock(); v = s; lock.unlock() }
+    func get() -> String? { lock.lock(); defer { lock.unlock() }; return v }
 }

@@ -6,3 +6,6 @@ build/
 Sori.prev
 tests/eval/personal/
 tests/eval/smoke/*.wav
+
+__pycache__/
+tests/eval/spend.tsv

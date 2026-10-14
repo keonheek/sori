@@ -66,6 +66,10 @@ struct Config: Codable {
     var historyRetentionDays: Int? = nil   // 0/nil = forever; purge older rows at launch
     var commandMode: Bool? = nil           // Experimental: Right ⌘ + Right ⌥ edits the selection
     var streamingASR: Bool? = nil          // Experimental: transcribe while recording (OpenAI)
+    var liveDelay: String? = nil           // gpt-live-transcribe delay: minimal/low/medium/high/xhigh (default medium)
+    var streamSegmentSec: Double? = nil    // streaming: commit at a pause once this much audio is pending (0/nil = one commit at release)
+    var streamPauseMs: Int? = nil          // streaming: silence that counts as a pause (default 600)
+    var streamCarryContext: Bool? = nil    // streaming: feed the text so far into the next segment's prompt
     var instantPaste: Bool? = nil          // Experimental: paste the rule-cleaned text at once, replace in place when the rewrite lands
     var contextAwareness: Bool? = nil      // send the focused field's text before the caret to Smart Rewrite (default on)
     // Paste lands where the dictation was STARTED, not wherever he is when ASR finishes: if he

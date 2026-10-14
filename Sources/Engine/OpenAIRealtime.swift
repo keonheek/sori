@@ -2,15 +2,22 @@ import Foundation
 import AVFoundation
 
 // MARK: - Streaming transcription over the OpenAI Realtime API (Experimental, P7)
-// Audio is appended while recording; on release only the tail is pending, so release→text is a
-// commit round-trip instead of a full upload. GA shape (2026): session.update with
-// session.type = "transcription", audio/pcm 24 kHz, turn_detection null + manual commit.
+// Audio is appended while recording. GA shape (2026): session.update with session.type =
+// "transcription", audio/pcm 24 kHz, turn_detection null + manual commit.
+// The server only transcribes what has been COMMITTED, so one commit at release made release→text
+// grow with dictation length (1.0 s for 5 s clips, 2.4-3.9 s past 40 s; 2026-10-14). With
+// segmentSec > 0 the client also commits at a pause once that much audio is pending, so earlier
+// segments are transcribed while he is still talking and release only waits for the tail.
+// Segments are stitched in commit order; with carryContext the text so far becomes the next
+// segment's prompt so it continues the sentence instead of starting a new one.
 final class OpenAIRealtime {
     static let sampleRate: Double = 24000
     private let task: URLSessionWebSocketTask
     private let session: URLSession
     private let lock = NSLock()
-    private var completed: [String] = []
+    private var order: [String] = []              // item ids in commit order (input_audio_buffer.committed)
+    private var texts: [String: String] = [:]     // item id → transcript
+    private var commitsSent = 0
     private var deltas = 0
     private var failed: String? = nil
     private var closed = false
@@ -18,28 +25,66 @@ final class OpenAIRealtime {
     private(set) var ready = false
     let startedAt = Date()
 
+    // Segmentation state lives on the audio thread (append); counters shared with finish are under lock.
+    private let model: String
+    private let basePrompt: String
+    private let segmentSamples: Int
+    private let pauseSamples: Int
+    private let carryContext: Bool
+    private var pendingSamples = 0
+    private var silenceRun = 0
+    private var noiseFloor: Float = 0.01
+    private var speechInPending = false
+
     // The server refuses a bare /v1/realtime ("You must provide a model parameter"); transcription
     // sessions connect with intent=transcription (verified 2026-09-20).
-    init?(model: String, prompt: String, endpoint: String = "wss://api.openai.com/v1/realtime?intent=transcription") {
+    init?(model: String, prompt: String, segmentSec: Double = 0, pauseMs: Int = 600, carryContext: Bool = true,
+          endpoint: String = "wss://api.openai.com/v1/realtime?intent=transcription") {
         guard let key = OpenAITranscribe.apiKey(), !key.isEmpty,
               let url = URL(string: endpoint) else { return nil }
+        self.model = model
+        self.basePrompt = prompt
+        self.segmentSamples = Int(segmentSec * OpenAIRealtime.sampleRate)
+        self.pauseSamples = Int(Double(pauseMs) / 1000 * OpenAIRealtime.sampleRate)
+        self.carryContext = carryContext
         var req = URLRequest(url: url)
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         session = URLSession(configuration: .default)
         task = session.webSocketTask(with: req)
         task.resume()
+        sendSessionUpdate(prompt: prompt)
+        receiveLoop()
+    }
+
+    // gpt-live-transcribe (2026-07-28) emits deltas while audio arrives instead of starting at the
+    // commit; it takes literal terms as `keywords` (one line each, no < >), a `delay` knob, and
+    // `languages` hints. The bias list Sori builds is comma-joined terms, so it maps onto keywords.
+    var isLive: Bool { model.hasPrefix("gpt-live") }
+    // medium: same release→text as low/minimal on his clips (p50 0.77 s) with the best accuracy
+    // (3.1% CER on the read-aloud set vs 5.1% at low; bench 2026-10-14). Conf key liveDelay overrides.
+    static var liveDelay: String { ProcessInfo.processInfo.environment["SORI_LIVE_DELAY"] ?? Config.load().liveDelay ?? "medium" }
+
+    private func sendSessionUpdate(prompt: String) {
         var transcription: [String: Any] = ["model": model]
-        if !prompt.isEmpty { transcription["prompt"] = prompt }
-        let update: [String: Any] = ["type": "session.update", "session": [
+        if isLive {
+            let terms = prompt.components(separatedBy: CharacterSet(charactersIn: ",\n"))
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty && $0.count <= 60 && !$0.contains("<") && !$0.contains(">") && !$0.contains(":") }
+            var seen = Set<String>()
+            let kw = terms.filter { seen.insert($0.lowercased()).inserted }.prefix(100)
+            if !kw.isEmpty { transcription["keywords"] = Array(kw) }
+            transcription["languages"] = ["ko", "en"]
+            transcription["delay"] = OpenAIRealtime.liveDelay
+            transcription["prompt"] = "Push-to-talk dictation by one speaker who mixes Korean and English, often about AI and software."
+        } else if !prompt.isEmpty { transcription["prompt"] = prompt }
+        send(["type": "session.update", "session": [
             "type": "transcription",
             "audio": ["input": [
                 "format": ["type": "audio/pcm", "rate": Int(OpenAIRealtime.sampleRate)],
                 "transcription": transcription,
                 "turn_detection": NSNull(),
             ]],
-        ]]
-        send(update)
-        receiveLoop()
+        ]])
     }
 
     private func send(_ obj: [String: Any]) {
@@ -52,19 +97,68 @@ final class OpenAIRealtime {
     func append(pcm16: Data) {
         guard !closed, !pcm16.isEmpty else { return }
         send(["type": "input_audio_buffer.append", "audio": pcm16.base64EncodedString()])
+        guard segmentSamples > 0 else { return }
+        // Energy pause detector: a chunk is silence when it sits near the tracked noise floor.
+        let n = pcm16.count / 2
+        var sum: Float = 0
+        pcm16.withUnsafeBytes { raw in
+            let p = raw.bindMemory(to: Int16.self)
+            for i in 0..<n { let v = Float(p[i]) / 32768; sum += v * v }
+        }
+        let rms = n > 0 ? sqrtf(sum / Float(n)) : 0
+        noiseFloor = rms < noiseFloor ? rms : noiseFloor + (rms - noiseFloor) * 0.002
+        let silent = rms < max(noiseFloor * 3, 0.004)
+        pendingSamples += n
+        if silent { silenceRun += n } else { silenceRun = 0; speechInPending = true }
+        lock.lock(); let released = committedAt != nil; lock.unlock()
+        if !released, speechInPending, pendingSamples >= segmentSamples, silenceRun >= pauseSamples {
+            commitSegment(final: false)
+        }
     }
 
-    // Commit and wait for the transcript of everything appended so far. Nil = fall back to batch.
-    func finish(timeout: TimeInterval = 5) -> String? {
+    private func commitSegment(final: Bool) {
+        lock.lock(); commitsSent += 1; let k = commitsSent; lock.unlock()
+        pendingSamples = 0; silenceRun = 0; speechInPending = false
         send(["type": "input_audio_buffer.commit"])
-        let t0 = Date()
-        _ = done.wait(timeout: .now() + timeout)
-        lock.lock(); let text = completed.joined(separator: " "); let err = failed; let n = deltas; lock.unlock()
+        if !final { wlog(String(format: "realtime: segment %d committed at a pause (%.1fs)", k, Date().timeIntervalSince(startedAt))) }
+    }
+
+    // Commit the tail as soon as the key comes up, so the server starts on it while the app is still
+    // moving the WAV and running the local VAD gate (that work cost 0.1-0.5 s before the commit).
+    private var committedAt: Date?
+    func commit() {
+        lock.lock(); let already = committedAt != nil; if !already { committedAt = Date() }; let sent = commitsSent; lock.unlock()
+        guard !already else { return }
+        // A silent tail after a pause commit is skipped: the server rejects an empty buffer, and that
+        // error would throw the whole dictation onto the batch fallback.
+        if sent > 0 && (!speechInPending || pendingSamples < Int(0.15 * OpenAIRealtime.sampleRate)) {
+            wlog("realtime: tail after the last segment is silence — not committed")
+            return
+        }
+        commitSegment(final: true)
+    }
+
+    // Commit (if not already) and wait for every committed segment's transcript. Nil = fall back to batch.
+    func finish(timeout: TimeInterval = 5) -> String? {
+        commit()
+        lock.lock(); let t0 = committedAt ?? Date(); lock.unlock()
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            lock.lock(); let have = texts.count; let need = commitsSent; let err = failed; lock.unlock()
+            if err != nil || (need > 0 && have >= need) { break }
+            if done.wait(timeout: .now() + max(0, deadline.timeIntervalSinceNow)) == .timedOut { break }
+        }
+        lock.lock()
+        let ids = order + texts.keys.filter { !order.contains($0) }.sorted()
+        let text = ids.compactMap { texts[$0] }.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.joined(separator: " ")
+        let err = failed; let n = deltas; let have = texts.count; let need = commitsSent
+        lock.unlock()
         closed = true
         task.cancel(with: .normalClosure, reason: nil)
         if let err { wlog("realtime FAILED: \(err)"); return nil }
+        guard have >= need else { wlog("realtime: \(have)/\(need) segments within \(timeout)s (deltas \(n))"); return nil }
         guard !text.isEmpty else { wlog("realtime: no transcript within \(timeout)s (deltas \(n))"); return nil }
-        wlog(String(format: "realtime transcript in %.2fs after commit (%d deltas, session %.1fs)", Date().timeIntervalSince(t0), n, Date().timeIntervalSince(startedAt)))
+        wlog(String(format: "realtime transcript in %.2fs after commit (%d segments, %d deltas, session %.1fs)", Date().timeIntervalSince(t0), need, n, Date().timeIntervalSince(startedAt)))
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -83,11 +177,23 @@ final class OpenAIRealtime {
                     switch type {
                     case "session.created", "session.updated", "transcription_session.updated":
                         self.ready = true
+                    case "input_audio_buffer.committed":
+                        if let id = j["item_id"] as? String { self.lock.lock(); self.order.append(id); self.lock.unlock() }
                     case "conversation.item.input_audio_transcription.delta":
                         self.lock.lock(); self.deltas += 1; self.lock.unlock()
                     case "conversation.item.input_audio_transcription.completed":
                         let t = (j["transcript"] as? String) ?? ""
-                        self.lock.lock(); self.completed.append(t); self.lock.unlock()
+                        let id = (j["item_id"] as? String) ?? UUID().uuidString
+                        self.lock.lock()
+                        self.texts[id] = t
+                        let soFar = self.order.compactMap { self.texts[$0] }.joined(separator: " ")
+                        let more = self.committedAt == nil
+                        self.lock.unlock()
+                        // The next segment continues this text instead of starting a fresh sentence.
+                        if self.carryContext, more, !soFar.isEmpty {
+                            let tail = String(soFar.suffix(400))
+                            self.sendSessionUpdate(prompt: [self.basePrompt, tail].filter { !$0.isEmpty }.joined(separator: "\n\n"))
+                        }
                         self.done.signal()
                     case "error":
                         let m = ((j["error"] as? [String: Any])?["message"] as? String) ?? s

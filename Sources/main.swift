@@ -8,6 +8,14 @@ import IOKit.hid
 // terminal commands, not a second copy of the app, and must work while Sori is running.
 if CommandLine.arguments.contains("--version") { print("Sori \(soriVersion)"); exit(0) }
 if CommandLine.arguments.contains("--check-update") { Updater.runCLICheck() }
+if CommandLine.arguments.contains("--learn-test") { exit(Learn.selfTest() ? 0 : 1) }
+if CommandLine.arguments.contains("--script-test") {
+    let cases: [(String, Bool)] = [("Push it to main তারপর open it", true), ("Claude Code로 MCP 서버를 만들어서", false),
+        ("β-VAE와 α 값", false), ("學生 한자 OK", false), ("Привет", true), ("café naïve", false), ("これは", true), ("1,234번 — “quote” 👍", false)]
+    var ok = true
+    for (t, flagged) in cases { let got = TextCleanup.foreignScript(t) != nil; if got != flagged { ok = false }; print("\(got == flagged ? "ok  " : "FAIL") \(t)") }
+    exit(ok ? 0 : 1)
+}
 if CommandLine.arguments.contains("--engine-pipe-test") { exit(QwenServer.pipeSpinTest() ? 0 : 1) }
 // Store maintenance, run while the app is up (the store is multi-process safe: WAL + full mutex).
 if let i = CommandLine.arguments.firstIndex(of: "--import-log"), i + 1 < CommandLine.arguments.count {
@@ -77,9 +85,16 @@ if let i = CommandLine.arguments.firstIndex(of: "--stream-test"), i + 1 < Comman
     print("chunks: \(chunks.count) (\(chunks.count / 10)s of audio)")
     let ep = ProcessInfo.processInfo.environment["SORI_RT_ENDPOINT"] ?? "wss://api.openai.com/v1/realtime?intent=transcription"
     print("endpoint: \(ep)")
-    guard let rt = OpenAIRealtime(model: model, prompt: "", endpoint: ep) else { print("no client"); exit(1) }
+    // SORI_SEG=<sec> SORI_PAUSE=<ms> SORI_CARRY=0|1 exercise pause segmentation; SORI_PROMPT sets the bias prompt.
+    let env = ProcessInfo.processInfo.environment
+    let seg = Double(env["SORI_SEG"] ?? "") ?? 0
+    let pauseMs = Int(env["SORI_PAUSE"] ?? "") ?? 600
+    let cfgNow = Config.load()
+    let bias = env["SORI_PROMPT"] ?? [cfgNow.promptHint, DictionaryRepo.biasPrompt(cfg: cfgNow)].filter { !$0.isEmpty }.joined(separator: ", ")
+    guard let rt = OpenAIRealtime(model: model, prompt: bias, segmentSec: seg, pauseMs: pauseMs,
+                                  carryContext: env["SORI_CARRY"] != "0", endpoint: ep) else { print("no client"); exit(1) }
     usleep(300_000)
-    let pace: UInt32 = ProcessInfo.processInfo.environment["SORI_RT_PACE"] == "1" ? 100_000 : 10_000   // 1 = real-time
+    let pace: UInt32 = env["SORI_RT_PACE"] == "1" ? 100_000 : 10_000   // 1 = real-time
     for c in chunks { rt.append(pcm16: c); usleep(pace) }
     let t0 = Date()
     let text = rt.finish(timeout: 8)

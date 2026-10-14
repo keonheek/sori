@@ -68,6 +68,25 @@ enum TextCleanup {
     // ("Monday, Monday, Monday") is separate — clean() rule 3 handles it. Runs on every
     // final transcript regardless of cleanupEnabled: this is a decode-failure guard,
     // not style cleanup.
+    // Script flip guard: he dictates Korean and English only. gpt-live-transcribe once wrote a Korean
+    // connective as Bengali ("Push it to main তারপর", 2026-10-14). Any letter outside Latin, Greek
+    // (math), Hangul or Han means the transcript is not trustworthy and the batch path redoes it.
+    static func foreignScript(_ s: String) -> String? {
+        for u in s.unicodeScalars where u.properties.isAlphabetic {
+            switch u.value {
+            case 0x0041...0x024F, 0x1E00...0x1EFF,          // Latin
+                 0x0370...0x03FF,                           // Greek
+                 0x1100...0x11FF, 0x3130...0x318F, 0xA960...0xA97F, 0xAC00...0xD7FF,  // Hangul
+                 0x4E00...0x9FFF, 0x3400...0x4DBF, 0xF900...0xFAFF,                   // Han (한자)
+                 0xFF21...0xFF5A:                           // fullwidth Latin
+                continue
+            default:
+                return String(u)
+            }
+        }
+        return nil
+    }
+
     static func collapseRepetitionLoop(_ input: String) -> String {
         let terminators: Set<Character> = [".", "!", "?", "…"]
         // Split into sentence chunks, each keeping its terminator run + trailing space,

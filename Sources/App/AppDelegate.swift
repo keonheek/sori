@@ -642,7 +642,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         streamClient = nil; recorder.onPCM24k = nil
         if (cfg.streamingASR ?? false), (cfg.asrProvider ?? "local") == "openai" {
             let hint = [cfg.promptHint, DictionaryRepo.biasPrompt(cfg: cfg)].filter { !$0.isEmpty }.joined(separator: ", ")
-            if let c = OpenAIRealtime(model: cfg.asrCloudModel ?? "gpt-transcribe", prompt: hint) {
+            if let c = OpenAIRealtime(model: cfg.asrCloudModel ?? "gpt-transcribe", prompt: hint,
+                                      segmentSec: cfg.streamSegmentSec ?? 0, pauseMs: cfg.streamPauseMs ?? 600,
+                                      carryContext: cfg.streamCarryContext ?? true) {
                 streamClient = c
                 recorder.onPCM24k = { [weak c] data in c?.append(pcm16: data) }
                 wlog("streaming session opened")
@@ -778,6 +780,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let selection = asCommand ? CommandMode.selectedText() : nil
         if asCommand { wlog("command mode: selection \(selection.map { "\($0.count) chars" } ?? "none")") }
         recorder.stop { url in
+            if !asCommand { stream?.commit() }
             // Move the WAV to a unique path BEFORE queueing: a new recording restarts
             // /tmp/sori.wav immediately, which would clobber the file while a
             // still-running whisper reads it (transcription is async now).
@@ -955,9 +958,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 } else {
                     // Streaming session first (only the tail is pending), batch upload if it failed.
                     if let s = stream { cloudText = s.finish(timeout: 4) }
+                    if let t = cloudText, let bad = TextCleanup.foreignScript(t) {
+                        wlog("realtime transcript has a foreign script (\(bad)) — redoing with batch: \"\(t.prefix(80))\"")
+                        cloudText = nil
+                    }
                     if cloudText == nil {
                         let hint = [cfg.promptHint, vocabulary].filter { !$0.isEmpty }.joined(separator: ", ")
-                        cloudText = OpenAITranscribe.transcribe(wav: url.path, model: cfg.asrCloudModel ?? "gpt-transcribe", prompt: hint)
+                        // The live model has no file endpoint; the batch fallback always uses gpt-transcribe there.
+                        let model = cfg.asrCloudModel ?? "gpt-transcribe"
+                        cloudText = OpenAITranscribe.transcribe(wav: url.path, model: model.hasPrefix("gpt-live") ? "gpt-transcribe" : model, prompt: hint)
                         if cloudText == nil { wlog("openai transcribe FAILED — falling back to local qwen") }
                     }
                 }
@@ -1070,7 +1079,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // have nothing to fix, and the ~1s Groq round-trip is pure latency there.
                 let wordCount = t.split(whereSeparator: { $0.isWhitespace }).count
                 if level == .high && wordCount >= 3 {
-                    if let r = LLMCleanup.smartRewrite(t, context: context, tone: style.toneValue) { t = r }
+                    if let r = LLMCleanup.smartRewrite(t, context: context, tone: style.toneValue, deadline: wordCount > 100 ? 1.8 : 1.2) { t = r }
                 } else if level == .medium && wordCount >= 5, let rewritten = LLMCleanup.rewrite(t) {
                     t = TextCleanup.clean(rewritten)   // a deleted leading filler leaves a lowercase start
                 }
@@ -1197,7 +1206,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Learn-from-edits: remember what we pasted; if the user soon copies a close
         // variant (an in-place correction), infer a replacement rule — and also watch the
         // field itself (AX value) for a typed-over correction, which is how people actually fix it.
-        if cfg.learnEdits ?? true { self.watchForCorrection(of: text); self.watchFieldForCorrection(of: text) }
+        if cfg.learnEdits ?? true {
+            self.watchForCorrection(of: text)
+            let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+            if !Learn.fieldWatchSkip.contains(front) { self.watchFieldForCorrection(of: text) }
+        }
         // Press Enter to submit when: the global setting is on, OR the user
         // ended this recording by pressing Enter (which we consumed).
         if submit {
@@ -1242,22 +1255,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func considerCorrection(from: String, to: String) {
-        // Only learn small, word-level diffs (not a whole-sentence rewrite).
-        // Align from BOTH ends so an inserted/removed word doesn't shift every
-        // later token into a "diff" (the old same-index compare bailed on those).
-        let fa = from.split(separator: " ").map(String.init)
-        let ta = to.split(separator: " ").map(String.init)
-        guard !fa.isEmpty, !ta.isEmpty, abs(fa.count - ta.count) <= 2 else { return }
-        var i = 0
-        while i < min(fa.count, ta.count), fa[i] == ta[i] { i += 1 }
-        var j = 0
-        while j < min(fa.count, ta.count) - i, fa[fa.count - 1 - j] == ta[ta.count - 1 - j] { j += 1 }
-        let f = fa[i..<(fa.count - j)].joined(separator: " ")
-        let t = ta[i..<(ta.count - j)].joined(separator: " ")
-        // The differing span must be short (a word or two) — otherwise it's a rewrite.
-        guard f.count >= 2, f.count <= 40, !t.isEmpty, t.count <= 40,
-              f.lowercased() != t.lowercased() else { return }
-        guard f.split(separator: " ").count <= 3, t.split(separator: " ").count <= 3 else { return }
+        guard let (f, t) = Learn.correction(pasted: from, edited: to) else { return }
         // Learn on the FIRST confident correction. Requiring the same edit twice within
         // a 6s clipboard window meant it effectively never learned anything.
         DictionaryRepo.upsertLearned(from: f, to: t)

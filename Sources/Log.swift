@@ -38,9 +38,12 @@ let wlogDF: DateFormatter = {
     let d = DateFormatter(); d.dateFormat = "MM-dd HH:mm:ss.SSS"; return d
 }()
 let wlogLock = NSLock()
+let wlogToStderr = ProcessInfo.processInfo.environment["SORI_LOG_STDERR"] == "1"
 func wlog(_ msg: String) {
     let line = wlogDF.string(from: Date()) + " " + msg + "\n"
     guard let data = line.data(using: .utf8) else { return }
+    // CLI probes and benches log to stderr so they never interleave with the live app's log.
+    if wlogToStderr { FileHandle.standardError.write(data); return }
     wlogLock.lock(); defer { wlogLock.unlock() }
     if let size = (try? FileManager.default.attributesOfItem(atPath: logPath))?[.size] as? UInt64,
        size > logRotateBytes {
