@@ -43,6 +43,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var clickDownTimeNs: UInt64 = 0
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        ScreenVocab.preload()
         // Single-instance guard: launchd, Login Items, and session-restore can all launch
         // the app at login. The old NSRunningApplication pid check RACED on simultaneous
         // starts — both processes checked before either registered, both survived
@@ -642,12 +643,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         streamClient = nil; recorder.onPCM24k = nil
         if (cfg.streamingASR ?? false), (cfg.asrProvider ?? "local") == "openai" {
             let hint = [cfg.promptHint, DictionaryRepo.biasPrompt(cfg: cfg)].filter { !$0.isEmpty }.joined(separator: ", ")
-            if let c = OpenAIRealtime(model: cfg.asrCloudModel ?? "gpt-transcribe", prompt: hint,
+            let model = cfg.asrCloudModel ?? "gpt-transcribe"
+            let groups = DictionaryRepo.biasTermGroups(cfg: cfg)
+            let screen = model.hasPrefix("gpt-live") && (cfg.screenVocab ?? true)
+            if let c = OpenAIRealtime(model: model, prompt: hint, keywords: groups.all, names: groups.names, deferConfig: screen,
                                       segmentSec: cfg.streamSegmentSec ?? 0, pauseMs: cfg.streamPauseMs ?? 600,
                                       carryContext: cfg.streamCarryContext ?? true) {
                 streamClient = c
                 recorder.onPCM24k = { [weak c] data in c?.append(pcm16: data) }
                 wlog("streaming session opened")
+                // Wispr's dynamic vocab: read the focused window off-main, rank on main (spell checker).
+                if screen, let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier {
+                    let known = Set(groups.all.map { $0.lowercased() })
+                    DispatchQueue.global(qos: .userInitiated).async { [weak c] in
+                        let h = ScreenVocab.harvest(pid: pid)
+                        DispatchQueue.main.async {
+                            let t0 = Date()
+                            let terms = ScreenVocab.rank(texts: h.texts, title: h.title, known: known)
+                            c?.configure(screenTerms: terms)
+                            wlog("screen vocab: \(terms.count) terms (walk \(h.ms) ms, \(h.nodes) nodes, rank \(Int(Date().timeIntervalSince(t0) * 1000)) ms): \(terms.prefix(12).joined(separator: ", "))")
+                        }
+                    }
+                }
             }
         }
         let tPre = ms()

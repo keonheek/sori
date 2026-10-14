@@ -66,6 +66,7 @@ struct Config: Codable {
     var historyRetentionDays: Int? = nil   // 0/nil = forever; purge older rows at launch
     var commandMode: Bool? = nil           // Experimental: Right ⌘ + Right ⌥ edits the selection
     var streamingASR: Bool? = nil          // Experimental: transcribe while recording (OpenAI)
+    var screenVocab: Bool? = nil           // gpt-live-transcribe: words read off the focused window become keywords (default on)
     var liveDelay: String? = nil           // gpt-live-transcribe delay: minimal/low/medium/high/xhigh (default medium)
     var streamSegmentSec: Double? = nil    // streaming: commit at a pause once this much audio is pending (0/nil = one commit at release)
     var streamPauseMs: Int? = nil          // streaming: silence that counts as a pause (default 600)

@@ -83,19 +83,30 @@ enum DictionaryRepo {
     // ASR bias terms: starred first, then plain words, then correction targets, learned last.
     // Names first because no model can guess them; the AI glossary fills what is left of the cap.
     static func biasPrompt(cfg: Config) -> String {
+        let terms = biasTerms(cfg: cfg)
+        guard !terms.isEmpty else { return "" }
+        return "Vocabulary that may appear in the audio, spell these exactly: "
+             + terms.prefix(Config.maxBiasTerms).joined(separator: ", ")
+    }
+
+    // Every bias term, names first, uncapped: gpt-live-transcribe takes them as a `keywords` list
+    // instead of prompt prose, so the 12-term prompt cap does not apply there.
+    static func biasTerms(cfg: Config) -> [String] { biasTermGroups(cfg: cfg).all }
+
+    // names = his dictionary (what no model can guess); the AI glossary follows.
+    static func biasTermGroups(cfg: Config) -> (all: [String], names: Int) {
         var terms: [String] = []
         let entries = all()
         terms += entries.filter { $0.starred }.map { $0.canonical }
         terms += entries.filter { !$0.starred && !$0.isCorrection }.map { $0.word }
         terms += entries.filter { !$0.starred && $0.isCorrection && $0.source == "manual" }.map { $0.replacement }
+        var seenNames = Set<String>()
+        let names = terms.filter { !$0.isEmpty && seenNames.insert($0.lowercased()).inserted }.count
         if (cfg.aiTermsEnabled ?? true), let t = cfg.aiTerms?.trimmingCharacters(in: .whitespaces), !t.isEmpty {
             terms += t.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
         }
         var seen = Set<String>()
-        terms = terms.filter { !$0.isEmpty && seen.insert($0.lowercased()).inserted }
-        guard !terms.isEmpty else { return "" }
-        return "Vocabulary that may appear in the audio, spell these exactly: "
-             + terms.prefix(Config.maxBiasTerms).joined(separator: ", ")
+        return (terms.filter { !$0.isEmpty && seen.insert($0.lowercased()).inserted }, names)
     }
 
     // Post-ASR pass: corrections replace, plain words canonicalize casing. Whole-word on LATIN

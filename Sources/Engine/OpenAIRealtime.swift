@@ -38,7 +38,15 @@ final class OpenAIRealtime {
 
     // The server refuses a bare /v1/realtime ("You must provide a model parameter"); transcription
     // sessions connect with intent=transcription (verified 2026-09-20).
-    init?(model: String, prompt: String, segmentSec: Double = 0, pauseMs: Int = 600, carryContext: Bool = true,
+    // keywords: the live model's literal-term list (names first). deferConfig holds the session
+    // update (and buffers audio) until configure(screenTerms:) adds the words read off the screen at
+    // key-down; the socket handshake takes about as long, so nothing waits on it.
+    private let baseKeywords: [String]
+    private var configured = false
+    private var held: [Data] = []
+
+    init?(model: String, prompt: String, keywords: [String] = [], names: Int = 0, deferConfig: Bool = false,
+          segmentSec: Double = 0, pauseMs: Int = 600, carryContext: Bool = true,
           endpoint: String = "wss://api.openai.com/v1/realtime?intent=transcription") {
         guard let key = OpenAITranscribe.apiKey(), !key.isEmpty,
               let url = URL(string: endpoint) else { return nil }
@@ -47,14 +55,47 @@ final class OpenAIRealtime {
         self.segmentSamples = Int(segmentSec * OpenAIRealtime.sampleRate)
         self.pauseSamples = Int(Double(pauseMs) / 1000 * OpenAIRealtime.sampleRate)
         self.carryContext = carryContext
+        self.baseKeywords = keywords
+        self.nameCount = names
         var req = URLRequest(url: url)
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         session = URLSession(configuration: .default)
         task = session.webSocketTask(with: req)
         task.resume()
-        sendSessionUpdate(prompt: prompt)
+        if deferConfig {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.configure(screenTerms: []) }
+        } else {
+            configured = true
+            sendSessionUpdate(prompt: prompt)
+        }
         receiveLoop()
     }
+
+    // Once: send the session update with the screen words merged in, then release held audio.
+    func configure(screenTerms: [String]) {
+        lock.lock()
+        guard !configured else { lock.unlock(); return }
+        configured = true
+        screenKeywords = screenTerms
+        sendSessionUpdate(prompt: basePrompt)
+        let audio = held; held = []
+        for d in audio { send(["type": "input_audio_buffer.append", "audio": d.base64EncodedString()]) }
+        lock.unlock()
+    }
+    private var screenKeywords: [String] = []
+
+    // Names (dictionary) first, then screen words, then the rest; one line each, no < >.
+    static let maxKeywords = 80
+    static func mergeKeywords(base: [String], names: Int, screen: [String]) -> [String] {
+        var seen = Set<String>(), out: [String] = []
+        for t in Array(base.prefix(names)) + screen + Array(base.dropFirst(names)) {
+            let k = t.trimmingCharacters(in: .whitespaces)
+            guard ScreenVocab.safe(k), seen.insert(k.lowercased()).inserted else { continue }
+            out.append(k)
+        }
+        return Array(out.prefix(maxKeywords))
+    }
+    private let nameCount: Int
 
     // gpt-live-transcribe (2026-07-28) emits deltas while audio arrives instead of starting at the
     // commit; it takes literal terms as `keywords` (one line each, no < >), a `delay` knob, and
@@ -67,12 +108,10 @@ final class OpenAIRealtime {
     private func sendSessionUpdate(prompt: String) {
         var transcription: [String: Any] = ["model": model]
         if isLive {
-            let terms = prompt.components(separatedBy: CharacterSet(charactersIn: ",\n"))
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty && $0.count <= 60 && !$0.contains("<") && !$0.contains(">") && !$0.contains(":") }
-            var seen = Set<String>()
-            let kw = terms.filter { seen.insert($0.lowercased()).inserted }.prefix(100)
-            if !kw.isEmpty { transcription["keywords"] = Array(kw) }
+            // 2026-10-14: this used to re-split the 12-term bias PROMPT, so only 11 of ~55 terms
+            // arrived (the cap, and the first term carried the "…exactly:" prefix and was dropped).
+            let kw = OpenAIRealtime.mergeKeywords(base: baseKeywords, names: nameCount, screen: screenKeywords)
+            if !kw.isEmpty { transcription["keywords"] = kw }
             transcription["languages"] = ["ko", "en"]
             transcription["delay"] = OpenAIRealtime.liveDelay
             transcription["prompt"] = "Push-to-talk dictation by one speaker who mixes Korean and English, often about AI and software."
@@ -96,7 +135,9 @@ final class OpenAIRealtime {
 
     func append(pcm16: Data) {
         guard !closed, !pcm16.isEmpty else { return }
-        send(["type": "input_audio_buffer.append", "audio": pcm16.base64EncodedString()])
+        lock.lock()
+        if !configured { held.append(pcm16); lock.unlock() }
+        else { lock.unlock(); send(["type": "input_audio_buffer.append", "audio": pcm16.base64EncodedString()]) }
         guard segmentSamples > 0 else { return }
         // Energy pause detector: a chunk is silence when it sits near the tracked noise floor.
         let n = pcm16.count / 2
@@ -127,6 +168,7 @@ final class OpenAIRealtime {
     // moving the WAV and running the local VAD gate (that work cost 0.1-0.5 s before the commit).
     private var committedAt: Date?
     func commit() {
+        configure(screenTerms: [])   // a press shorter than the screen read: send what we have
         lock.lock(); let already = committedAt != nil; if !already { committedAt = Date() }; let sent = commitsSent; lock.unlock()
         guard !already else { return }
         // A silent tail after a pause commit is skipped: the server rejects an empty buffer, and that

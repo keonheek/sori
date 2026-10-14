@@ -12,7 +12,7 @@ IDLE_S=${IDLE_S:-8}
 IDENTITY="Gunny Local Codesign"
 
 swiftc -O -target arm64-apple-macos13.0 $(find Sources -name '*.swift') -o build/Sori-next
-./build/Sori-next --learn-test >/dev/null && ./build/Sori-next --script-test >/dev/null || { echo "self-tests FAILED — not deploying"; exit 1; }
+./build/Sori-next --learn-test >/dev/null && ./build/Sori-next --script-test >/dev/null && ./build/Sori-next --vocab-test >/dev/null || { echo "self-tests FAILED — not deploying"; exit 1; }
 
 idle() {
     local last; last=$(grep -E ">>> (startRecording|stopAndTranscribe|cancelRecording)" "$LOG" | tail -1)

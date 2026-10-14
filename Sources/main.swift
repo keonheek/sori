@@ -16,6 +16,16 @@ if CommandLine.arguments.contains("--script-test") {
     for (t, flagged) in cases { let got = TextCleanup.foreignScript(t) != nil; if got != flagged { ok = false }; print("\(got == flagged ? "ok  " : "FAIL") \(t)") }
     exit(ok ? 0 : 1)
 }
+if CommandLine.arguments.contains("--vocab-test") { exit(ScreenVocab.selfTest() ? 0 : 1) }
+// Screen-vocab probe on a running app (read-only Accessibility walk): --vocab-probe <bundle id>
+if let i = CommandLine.arguments.firstIndex(of: "--vocab-probe"), i + 1 < CommandLine.arguments.count {
+    guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: CommandLine.arguments[i + 1]).first else { print("not running"); exit(1) }
+    let h = ScreenVocab.harvest(pid: app.processIdentifier)
+    let t0 = Date()
+    let terms = ScreenVocab.rank(texts: h.texts, title: h.title, known: Set(DictionaryRepo.biasTerms(cfg: Config.load()).map { $0.lowercased() }))
+    print("walk \(h.ms) ms, \(h.nodes) nodes, \(h.chars) chars; rank \(Int(Date().timeIntervalSince(t0) * 1000)) ms; title: \(h.title)")
+    print(terms.joined(separator: " | ")); exit(0)
+}
 if CommandLine.arguments.contains("--engine-pipe-test") { exit(QwenServer.pipeSpinTest() ? 0 : 1) }
 // Store maintenance, run while the app is up (the store is multi-process safe: WAL + full mutex).
 if let i = CommandLine.arguments.firstIndex(of: "--import-log"), i + 1 < CommandLine.arguments.count {
@@ -91,8 +101,13 @@ if let i = CommandLine.arguments.firstIndex(of: "--stream-test"), i + 1 < Comman
     let pauseMs = Int(env["SORI_PAUSE"] ?? "") ?? 600
     let cfgNow = Config.load()
     let bias = env["SORI_PROMPT"] ?? [cfgNow.promptHint, DictionaryRepo.biasPrompt(cfg: cfgNow)].filter { !$0.isEmpty }.joined(separator: ", ")
-    guard let rt = OpenAIRealtime(model: model, prompt: bias, segmentSec: seg, pauseMs: pauseMs,
+    // SORI_KW=0 reverts to no keywords; SORI_SCREEN="a,b,c" simulates words read off the screen.
+    let groups = env["SORI_KW"] == "0" ? ([], 0) : DictionaryRepo.biasTermGroups(cfg: cfgNow)
+    let screenSim = (env["SORI_SCREEN"] ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+    guard let rt = OpenAIRealtime(model: model, prompt: bias, keywords: groups.0, names: groups.1, deferConfig: !screenSim.isEmpty,
+                                  segmentSec: seg, pauseMs: pauseMs,
                                   carryContext: env["SORI_CARRY"] != "0", endpoint: ep) else { print("no client"); exit(1) }
+    if !screenSim.isEmpty { usleep(150_000); rt.configure(screenTerms: screenSim) }
     usleep(300_000)
     let pace: UInt32 = env["SORI_RT_PACE"] == "1" ? 100_000 : 10_000   // 1 = real-time
     for c in chunks { rt.append(pcm16: c); usleep(pace) }
